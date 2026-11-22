@@ -1,400 +1,204 @@
-import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
+const TARGET_SAMPLE_RATE = 44100;
 
-// iOS Safari でのクラッシュ・WASMメモリ膨張を抑える設定
-ort.env.wasm.numThreads = 1;
-ort.env.wasm.proxy = false;
-ort.env.wasm.simd = false;
+const fileInput = document.getElementById("audioFile");
+const fileSub = document.getElementById("fileSub");
+const runBtn = document.getElementById("runBtn");
+const statusEl = document.getElementById("status");
+const dlLink = document.getElementById("dl-accompaniment");
 
-const ACCOMPANIMENT_MODEL_URL =
-  "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/accompaniment.onnx?download=true";
+let selectedFile = null;
+const worker = new Worker("worker.js?v=4", { type: "module" });
 
-const MODEL_CACHE_NAME = "wing-spleeter-accompaniment-cache-v1";
-
-// Spleeter 44.1kHz 標準 STFT パラメータ
-const N_FFT = 4096;
-const HOP_LENGTH = 1024;
-const FREQ_BINS = N_FFT / 2 + 1; // 2049
-const MODEL_FRAMES = 512; // 1ブロックあたりのフレーム数 (約11.88秒分)
-const MODEL_BINS = 1024;
-
-// 1ブロックあたりのサンプル数（512フレーム分にぴったり合わせる）
-const BLOCK_SAMPLES = MODEL_FRAMES * HOP_LENGTH; // 524,288 サンプル (約11.89秒)
-
-function createPeriodicHannWindow(length) {
-  const win = new Float32Array(length);
-  for (let i = 0; i < length; i++) {
-    win[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / length));
-  }
-  return win;
+function isAllowedAudio(file) {
+  if (!file) return false;
+  const nameOk = /\.(mp3|wav)$/i.test(file.name);
+  const typeOk = [
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/wave",
+    "audio/x-wav",
+  ].includes(file.type.toLowerCase());
+  return nameOk || typeOk;
 }
 
-const HANN_WINDOW = createPeriodicHannWindow(N_FFT);
-
-async function loadAccompanimentModelBuffer() {
-  const cacheSupported = typeof caches !== "undefined";
-
-  if (cacheSupported) {
-    const cache = await caches.open(MODEL_CACHE_NAME);
-    const cachedResponse = await cache.match(ACCOMPANIMENT_MODEL_URL);
-    if (cachedResponse && cachedResponse.ok) {
-      postMessage({
-        type: "progress",
-        message: "キャッシュから伴奏モデルを読込中...",
-      });
-      return await cachedResponse.arrayBuffer();
-    }
-
-    postMessage({
-      type: "progress",
-      message: "伴奏モデルを初回ダウンロード＆保存中...",
-    });
-
-    const response = await fetch(ACCOMPANIMENT_MODEL_URL);
-    if (!response.ok) {
-      throw new Error(`伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
-    }
-
-    await cache.put(ACCOMPANIMENT_MODEL_URL, response.clone());
-    return await response.arrayBuffer();
+function resetDownloadLink() {
+  if (!dlLink) return;
+  if (dlLink.href && dlLink.href.startsWith("blob:")) {
+    URL.revokeObjectURL(dlLink.href);
   }
-
-  postMessage({
-    type: "progress",
-    message: "伴奏モデルをダウンロード中...",
-  });
-
-  const response = await fetch(ACCOMPANIMENT_MODEL_URL);
-  if (!response.ok) {
-    throw new Error(`伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
-  }
-  return await response.arrayBuffer();
+  dlLink.classList.add("disabled");
+  dlLink.removeAttribute("href");
 }
 
-async function createAccompanimentSession() {
-  let modelBuffer = await loadAccompanimentModelBuffer();
-
-  postMessage({
-    type: "progress",
-    message: "AIセッションを展開中 (iOS軽量モード)...",
-  });
-
-  const modelBytes = new Uint8Array(modelBuffer);
-  modelBuffer = null;
-
-  return await ort.InferenceSession.create(modelBytes, {
-    executionProviders: ["wasm"],
-    enableMemPattern: false,
-    enableCpuMemArena: false,
-    graphOptimizationLevel: "basic",
-  });
-}
-
-async function releaseSession(session) {
-  if (!session) return;
-  try {
-    if (typeof session.release === "function") {
-      await session.release();
-    }
-  } catch (_) {}
-}
-
-function fftInPlace(re, im, dir) {
-  const n = re.length;
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) {
-      j ^= bit;
-    }
-    j ^= bit;
-    if (i < j) {
-      const tmpR = re[i];
-      re[i] = re[j];
-      re[j] = tmpR;
-      const tmpI = im[i];
-      im[i] = im[j];
-      im[j] = tmpI;
-    }
+async function normalizeTo44100Stereo(decodedBuffer) {
+  const numChannels = decodedBuffer.numberOfChannels;
+  if (numChannels < 1) {
+    throw new Error("有効な音声チャンネルが見つかりませんでした。");
   }
 
-  for (let len = 2; len <= n; len <<= 1) {
-    const half = len >> 1;
-    const ang = (dir * -2 * Math.PI) / len;
-    const wLenR = Math.cos(ang);
-    const wLenI = Math.sin(ang);
+  const needsResample = decodedBuffer.sampleRate !== TARGET_SAMPLE_RATE;
+  const needsChannelConvert = numChannels !== 2;
 
-    for (let i = 0; i < n; i += len) {
-      let wR = 1;
-      let wI = 0;
-      for (let k = 0; k < half; k++) {
-        const uR = re[i + k];
-        const uI = im[i + k];
-        const vR = re[i + k + half] * wR - im[i + k + half] * wI;
-        const vI = re[i + k + half] * wI + im[i + k + half] * wR;
-
-        re[i + k] = uR + vR;
-        im[i + k] = uI + vI;
-        re[i + k + half] = uR - vR;
-        im[i + k + half] = uI - vI;
-
-        const nextWR = wR * wLenR - wI * wLenI;
-        wI = wR * wLenI + wI * wLenR;
-        wR = nextWR;
-      }
-    }
+  if (!needsResample && !needsChannelConvert) {
+    return decodedBuffer;
   }
 
-  if (dir === -1) {
-    for (let i = 0; i < n; i++) {
-      re[i] /= n;
-      im[i] /= n;
-    }
+  const targetLength = Math.ceil(decodedBuffer.duration * TARGET_SAMPLE_RATE);
+  const offlineCtx = new OfflineAudioContext(2, targetLength, TARGET_SAMPLE_RATE);
+  const inputForRender = offlineCtx.createBuffer(
+    Math.min(numChannels, 2),
+    decodedBuffer.length,
+    decodedBuffer.sampleRate
+  );
+
+  if (numChannels === 1) {
+    const mono = decodedBuffer.getChannelData(0);
+    inputForRender.copyToChannel(mono, 0);
+    inputForRender.copyToChannel(mono, 1);
+  } else {
+    inputForRender.copyToChannel(decodedBuffer.getChannelData(0), 0);
+    inputForRender.copyToChannel(decodedBuffer.getChannelData(1), 1);
   }
+
+  const source = offlineCtx.createBufferSource();
+  source.buffer = inputForRender;
+  source.connect(offlineCtx.destination);
+  source.start(0);
+  const rendered = await offlineCtx.startRendering();
+  source.disconnect();
+  return rendered;
 }
 
-function computeStft(samples) {
-  const numFrames = Math.max(1, Math.floor((samples.length - N_FFT) / HOP_LENGTH) + 1);
-  const reOut = new Float32Array(numFrames * FREQ_BINS);
-  const imOut = new Float32Array(numFrames * FREQ_BINS);
+fileInput.addEventListener("change", (e) => {
+  const file = e.target.files?.[0];
+  resetDownloadLink();
 
-  const frameRe = new Float32Array(N_FFT);
-  const frameIm = new Float32Array(N_FFT);
-
-  for (let f = 0; f < numFrames; f++) {
-    const start = f * HOP_LENGTH;
-    for (let i = 0; i < N_FFT; i++) {
-      const idx = start + i;
-      const val = idx < samples.length ? samples[idx] : 0;
-      frameRe[i] = val * HANN_WINDOW[i];
-      frameIm[i] = 0;
-    }
-
-    fftInPlace(frameRe, frameIm, 1);
-
-    const base = f * FREQ_BINS;
-    for (let b = 0; b < FREQ_BINS; b++) {
-      reOut[base + b] = frameRe[b];
-      imOut[base + b] = frameIm[b];
-    }
+  if (!isAllowedAudio(file)) {
+    selectedFile = null;
+    runBtn.disabled = true;
+    fileSub.textContent = "対応形式: MP3 / WAV (44100Hz・ステレオへ自動変換)";
+    statusEl.textContent = "エラー: MP3 または WAVファイルのみ対応しています。";
+    return;
   }
 
-  return { numFrames, re: reOut, im: imOut };
-}
+  selectedFile = file;
+  runBtn.disabled = false;
+  const mb = (file.size / 1024 / 1024).toFixed(2);
+  fileSub.textContent = `${file.name} (${mb} MB)`;
+  statusEl.textContent = `選択完了: ${file.name} - 「伴奏抽出を実行！」を押してください。`;
+});
 
-function computeIstft(reSpec, imSpec, numFrames, outputLength) {
-  const out = new Float32Array(outputLength);
-  const norm = new Float32Array(outputLength);
-  const frameRe = new Float32Array(N_FFT);
-  const frameIm = new Float32Array(N_FFT);
-
-  for (let f = 0; f < numFrames; f++) {
-    const base = f * FREQ_BINS;
-
-    frameRe[0] = reSpec[base];
-    frameIm[0] = 0;
-    frameRe[N_FFT / 2] = reSpec[base + N_FFT / 2];
-    frameIm[N_FFT / 2] = 0;
-
-    for (let b = 1; b < N_FFT / 2; b++) {
-      const r = reSpec[base + b];
-      const im = imSpec[base + b];
-      frameRe[b] = r;
-      frameIm[b] = im;
-      frameRe[N_FFT - b] = r;
-      frameIm[N_FFT - b] = -im;
-    }
-
-    fftInPlace(frameRe, frameIm, -1);
-
-    const start = f * HOP_LENGTH;
-    for (let i = 0; i < N_FFT; i++) {
-      const idx = start + i;
-      if (idx < outputLength) {
-        const w = HANN_WINDOW[i];
-        out[idx] += frameRe[i] * w;
-        norm[idx] += w * w;
-      }
-    }
-  }
-
-  for (let i = 0; i < outputLength; i++) {
-    if (norm[i] > 1e-8) {
-      out[i] /= norm[i];
-    }
-  }
-
-  return out;
-}
-
-function buildSingleBlockTensor(session, leftStft, rightStft) {
-  const inputName = session.inputNames[0];
-  const meta = session.inputMetadata?.[inputName];
-  const dims = meta?.dimensions || [2, 1, MODEL_FRAMES, MODEL_BINS];
-
-  const chDim = typeof dims[0] === "number" && dims[0] > 0 ? dims[0] : 2;
-  const numSplits = 1;
-  const axis2 = typeof dims[2] === "number" && dims[2] > 0 ? dims[2] : MODEL_FRAMES;
-  const freqBins = typeof dims[3] === "number" && dims[3] > 0 ? dims[3] : MODEL_BINS;
-
-  const totalFrames = leftStft.numFrames;
-  const data = new Float32Array(chDim * numSplits * axis2 * freqBins);
-
-  for (let c = 0; c < chDim; c++) {
-    const srcRe = c === 0 ? leftStft.re : rightStft.re;
-    const srcIm = c === 0 ? leftStft.im : rightStft.im;
-
-    const copyFrames = Math.min(axis2, totalFrames);
-    for (let t = 0; t < copyFrames; t++) {
-      const dstOffset = (c * axis2 + t) * freqBins;
-      const srcOffset = t * FREQ_BINS;
-      const copyBins = Math.min(freqBins, FREQ_BINS);
-      for (let b = 0; b < copyBins; b++) {
-        const r = srcRe[srcOffset + b];
-        const im = srcIm[srcOffset + b];
-        data[dstOffset + b] = Math.hypot(r, im);
-      }
-    }
-  }
-
-  return {
-    tensor: new ort.Tensor("float32", data, [chDim, numSplits, axis2, freqBins]),
-    axis2,
-    freqBins,
-  };
-}
-
-function reconChannelSingleBlock(stftObj, chIdx, outTensor, metaInfo, outputLength) {
-  const { axis2, freqBins } = metaInfo;
-  const dims = outTensor.dims || [];
-  const chCountInOut = dims.length >= 1 && dims[0] >= 2 ? 2 : 1;
-  const outData = outTensor.data;
-  const totalFrames = stftObj.numFrames;
-
-  const mRe = new Float32Array(stftObj.re.length);
-  const mIm = new Float32Array(stftObj.im.length);
-
-  for (let f = 0; f < totalFrames; f++) {
-    const base = f * FREQ_BINS;
-
-    for (let b = 0; b < FREQ_BINS; b++) {
-      const r = stftObj.re[base + b];
-      const im = stftObj.im[base + b];
-      const origMag = Math.hypot(r, im);
-
-      let gain = 1.0;
-      if (f < axis2 && b < freqBins) {
-        const actualCh = chCountInOut >= 2 ? chIdx : 0;
-        const outIdx = (actualCh * axis2 + f) * freqBins + b;
-        const predVal = outData[outIdx];
-        if (typeof predVal === "number" && Number.isFinite(predVal)) {
-          gain = origMag > 1e-6 ? Math.max(0, Math.min(2.0, predVal / origMag)) : 0;
-        }
-      }
-
-      mRe[base + b] = r * gain;
-      mIm[base + b] = im * gain;
-    }
-  }
-
-  return computeIstft(mRe, mIm, totalFrames, outputLength);
-}
-
-function clampBuffer(buf) {
-  for (let i = 0; i < buf.length; i++) {
-    if (buf[i] > 1) buf[i] = 1;
-    else if (buf[i] < -1) buf[i] = -1;
-  }
-}
-
-// ブラウザにGC（メモリ解放）の余地を与えるための短い待機
-function yieldForGC(ms = 80) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-self.onmessage = async (e) => {
-  let session = null;
+runBtn.addEventListener("click", async () => {
+  if (!selectedFile) return;
+  runBtn.disabled = true;
+  resetDownloadLink();
+  statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
-    const { sampleRate, left, right } = e.data;
-    const totalLength = left.length;
+    const arrayBuffer = await selectedFile.arrayBuffer();
+    const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+    const audioCtx = new AudioContextClass();
+    let audioBuffer;
 
-    const dstLeft = new Float32Array(totalLength);
-    const dstRight = new Float32Array(totalLength);
-
-    const totalBlocks = Math.max(1, Math.ceil(totalLength / BLOCK_SAMPLES));
-
-    session = await createAccompanimentSession();
-    const inputName = session.inputNames[0];
-    const outputName = session.outputNames[0];
-
-    for (let blockIdx = 0; blockIdx < totalBlocks; blockIdx++) {
-      const start = blockIdx * BLOCK_SAMPLES;
-      const end = Math.min(totalLength, start + BLOCK_SAMPLES);
-      const pct = Math.round(((blockIdx + 1) / totalBlocks) * 100);
-
-      postMessage({
-        type: "progress",
-        message: `伴奏を抽出中... ${pct}% (${blockIdx + 1}/${totalBlocks})`,
-      });
-
-      const leftSlice = left.subarray(start, end);
-      const rightSlice = right.subarray(start, end);
-
-      let leftStft = computeStft(leftSlice);
-      let rightStft = computeStft(rightSlice);
-
-      const built = buildSingleBlockTensor(session, leftStft, rightStft);
-      const results = await session.run({ [inputName]: built.tensor });
-      const outTensor = results[outputName];
-
-      if (!outTensor) {
-        built.tensor.dispose();
-        throw new Error(`出力 "${outputName}" が取得できませんでした。`);
-      }
-
-      const outL = reconChannelSingleBlock(leftStft, 0, outTensor, built, leftSlice.length);
-      const outR = reconChannelSingleBlock(rightStft, 1, outTensor, built, rightSlice.length);
-
-      built.tensor.dispose();
-      outTensor.dispose();
-      leftStft = null;
-      rightStft = null;
-
-      dstLeft.set(outL, start);
-      dstRight.set(outR, start);
-
-      // 複数ブロックある場合は次の推論前に一瞬休ませてメモリ解放を促す
-      if (blockIdx < totalBlocks - 1) {
-        await yieldForGC(120);
+    try {
+      audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+    } finally {
+      if (typeof audioCtx.close === "function") {
+        await audioCtx.close().catch(() => {});
       }
     }
 
-    await releaseSession(session);
-    session = null;
+    const needsConvert =
+      audioBuffer.sampleRate !== TARGET_SAMPLE_RATE ||
+      audioBuffer.numberOfChannels !== 2;
 
-    clampBuffer(dstLeft);
-    clampBuffer(dstRight);
+    if (needsConvert) {
+      statusEl.textContent = `ステップ1/3: 44100Hz・ステレオに変換中... (元: ${audioBuffer.sampleRate}Hz / ${audioBuffer.numberOfChannels}ch)`;
+    }
 
-    postMessage({
-      type: "progress",
-      message: "伴奏WAVデータを転送中...",
-    });
+    const normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
+    const left = new Float32Array(normalizedBuffer.getChannelData(0));
+    const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
-    postMessage(
+    statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
+    worker.postMessage(
       {
-        type: "done",
-        sampleRate,
-        accompaniment: {
-          left: dstLeft,
-          right: dstRight,
-        },
+        sampleRate: normalizedBuffer.sampleRate,
+        left,
+        right,
       },
-      [dstLeft.buffer, dstRight.buffer]
+      [left.buffer, right.buffer]
     );
   } catch (err) {
-    await releaseSession(session);
-    postMessage({
-      type: "error",
-      message: err?.message || String(err),
-    });
+    statusEl.textContent = `読み込み・変換エラー: ${err.message}`;
+    runBtn.disabled = false;
   }
+});
+
+function encodeWav(chL, chR, sampleRate) {
+  const numChannels = 2;
+  const length = chL.length;
+  const buffer = new ArrayBuffer(44 + length * numChannels * 2);
+  const view = new DataView(buffer);
+
+  const writeStr = (offset, str) => {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  };
+
+  writeStr(0, "RIFF");
+  view.setUint32(4, 36 + length * numChannels * 2, true);
+  writeStr(8, "WAVE");
+  writeStr(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, numChannels, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * numChannels * 2, true);
+  view.setUint16(32, numChannels * 2, true);
+  view.setUint16(34, 16, true);
+  writeStr(36, "data");
+  view.setUint32(40, length * numChannels * 2, true);
+
+  let offset = 44;
+  for (let i = 0; i < length; i++) {
+    const sL = Math.max(-1, Math.min(1, chL[i]));
+    const sR = Math.max(-1, Math.min(1, chR[i]));
+    view.setInt16(offset, sL < 0 ? sL * 0x8000 : sL * 0x7fff, true);
+    view.setInt16(offset + 2, sR < 0 ? sR * 0x8000 : sR * 0x7fff, true);
+    offset += 4;
+  }
+
+  return new Blob([buffer], { type: "audio/wav" });
+}
+
+worker.onmessage = (e) => {
+  const { type, message, accompaniment, sampleRate } = e.data;
+
+  if (type === "progress") {
+    statusEl.textContent = message;
+  } else if (type === "done") {
+    statusEl.textContent = "ステップ3/3: 伴奏WAVファイルを生成中...";
+
+    if (dlLink && accompaniment) {
+      const blob = encodeWav(accompaniment.left, accompaniment.right, sampleRate);
+      dlLink.href = URL.createObjectURL(blob);
+      dlLink.classList.remove("disabled");
+      accompaniment.left = null;
+      accompaniment.right = null;
+    }
+
+    statusEl.textContent = "完了! 伴奏WAVを保存できます。";
+    runBtn.disabled = false;
+  } else if (type === "error") {
+    statusEl.textContent = `分離エラー: ${message || "処理中にエラーが発生しました。"}`;
+    runBtn.disabled = false;
+  }
+};
+
+worker.onerror = (err) => {
+  statusEl.textContent = `ワーカーエラー: ${err.message || "予期しないエラーが発生しました。"}`;
+  runBtn.disabled = false;
 };
