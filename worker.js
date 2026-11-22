@@ -6,9 +6,9 @@ ort.env.wasm.proxy = false;
 ort.env.wasm.simd = false;
 
 const ACCOMPANIMENT_MODEL_URL =
-  "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems-fp16/resolve/main/accompaniment.fp16.onnx?download=true";
+  "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/accompaniment.onnx?download=true";
 
-const MODEL_CACHE_NAME = "wing-spleeter-accompaniment-fp16-cache-v1";
+const MODEL_CACHE_NAME = "wing-spleeter-accompaniment-cache-v1";
 
 // Spleeter 44.1kHz 標準 STFT パラメータ
 const N_FFT = 4096;
@@ -24,58 +24,8 @@ const BLOCK_SAMPLES = MODEL_FRAMES * HOP_LENGTH; // 524,288 サンプル
 const CROSSFADE_SAMPLES = 32 * HOP_LENGTH; // 32,768 サンプル
 const STEP_SAMPLES = Math.max(HOP_LENGTH * 16, BLOCK_SAMPLES - CROSSFADE_SAMPLES);
 
-// 4ブロックごとにセッションを解放・再生成して WASM ヒープ膨張を抑制
+// 4ブロックごとにセッションを解放・再生成して iOS の WASM ヒープ膨張を抑制
 const SESSION_RECYCLE_BLOCKS = 4;
-
-// IEEE 754 float32 -> float16 (Uint16) 変換用バッファ
-const f32View = new Float32Array(1);
-const u32View = new Uint32Array(f32View.buffer);
-
-function floatToFloat16Bits(val) {
-  f32View[0] = val;
-  const bits = u32View[0];
-  const sign = (bits >>> 16) & 0x8000;
-  let exp = ((bits >>> 23) & 0xff) - 127 + 15;
-  let frac = (bits >>> 13) & 0x03ff;
-
-  if (exp <= 0) {
-    if (exp < -10) return sign;
-    frac = (frac | 0x0400) >>> (1 - exp);
-    return sign | frac;
-  }
-  if (exp >= 31) {
-    return sign | 0x7c00;
-  }
-  return sign | (exp << 10) | frac;
-}
-
-function float16BitsToFloat(h) {
-  const s = (h & 0x8000) << 16;
-  const e = (h & 0x7c00) >>> 10;
-  const f = h & 0x03ff;
-
-  if (e === 0) {
-    if (f === 0) {
-      u32View[0] = s;
-      return f32View[0];
-    }
-    let mant = f;
-    let exp = -14;
-    while ((mant & 0x0400) === 0) {
-      mant <<= 1;
-      exp--;
-    }
-    mant &= 0x03ff;
-    u32View[0] = s | ((exp + 127) << 23) | (mant << 13);
-    return f32View[0];
-  }
-  if (e === 31) {
-    u32View[0] = s | 0x7f800000 | (f << 13);
-    return f32View[0];
-  }
-  u32View[0] = s | ((e - 15 + 127) << 23) | (f << 13);
-  return f32View[0];
-}
 
 function createPeriodicHannWindow(length) {
   const win = new Float32Array(length);
@@ -96,7 +46,7 @@ async function loadAccompanimentModelBytes() {
     if (cachedResponse && cachedResponse.ok) {
       postMessage({
         type: "progress",
-        message: "キャッシュからFP16伴奏モデルを読込中...",
+        message: "キャッシュから伴奏モデルを読込中...",
       });
       const buf = await cachedResponse.arrayBuffer();
       return new Uint8Array(buf);
@@ -104,12 +54,12 @@ async function loadAccompanimentModelBytes() {
 
     postMessage({
       type: "progress",
-      message: "FP16伴奏モデルを初回ダウンロード＆保存中...",
+      message: "伴奏モデルを初回ダウンロード＆保存中...",
     });
 
     const response = await fetch(ACCOMPANIMENT_MODEL_URL);
     if (!response.ok) {
-      throw new Error(`FP16伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
+      throw new Error(`伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
     }
 
     await cache.put(ACCOMPANIMENT_MODEL_URL, response.clone());
@@ -119,12 +69,12 @@ async function loadAccompanimentModelBytes() {
 
   postMessage({
     type: "progress",
-    message: "FP16伴奏モデルをダウンロード中...",
+    message: "伴奏モデルをダウンロード中...",
   });
 
   const response = await fetch(ACCOMPANIMENT_MODEL_URL);
   if (!response.ok) {
-    throw new Error(`FP16伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
+    throw new Error(`伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
   }
   const buf = await response.arrayBuffer();
   return new Uint8Array(buf);
@@ -279,7 +229,6 @@ function buildFixed512Tensor(session, leftStft, rightStft) {
   const inputName = session.inputNames[0];
   const meta = session.inputMetadata?.[inputName];
   const dims = meta?.dimensions || [];
-  const isFloat16Input = meta?.type === "float16";
 
   const chDim = typeof dims[0] === "number" && dims[0] > 0 ? dims[0] : 2;
   const numSplits = typeof dims[1] === "number" && dims[1] > 0 ? dims[1] : 1;
@@ -289,10 +238,7 @@ function buildFixed512Tensor(session, leftStft, rightStft) {
     typeof dims[3] === "number" && dims[3] > 0 ? dims[3] : MODEL_BINS;
 
   const totalFrames = leftStft.numFrames;
-  const totalElements = chDim * numSplits * targetFrames * freqBins;
-  const data = isFloat16Input
-    ? new Uint16Array(totalElements)
-    : new Float32Array(totalElements);
+  const data = new Float32Array(chDim * numSplits * targetFrames * freqBins);
 
   for (let c = 0; c < chDim; c++) {
     const srcRe = c === 0 ? leftStft.re : rightStft.re;
@@ -308,37 +254,25 @@ function buildFixed512Tensor(session, leftStft, rightStft) {
         for (let b = 0; b < copyBins; b++) {
           const r = srcRe[srcOffset + b];
           const im = srcIm[srcOffset + b];
-          const mag = Math.hypot(r, im);
-          data[dstOffset + b] = isFloat16Input ? floatToFloat16Bits(mag) : mag;
+          data[dstOffset + b] = Math.hypot(r, im);
         }
       }
     }
   }
 
   return {
-    tensor: new ort.Tensor(
-      isFloat16Input ? "float16" : "float32",
-      data,
-      [chDim, numSplits, targetFrames, freqBins]
-    ),
+    tensor: new ort.Tensor("float32", data, [chDim, numSplits, targetFrames, freqBins]),
     numSplits,
     targetFrames,
     freqBins,
   };
 }
 
-function readOutputValue(outTensor, outIdx) {
-  const raw = outTensor.data[outIdx];
-  if (outTensor.type === "float16" || outTensor.data instanceof Uint16Array) {
-    return float16BitsToFloat(raw);
-  }
-  return raw;
-}
-
 function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength) {
   const { numSplits, targetFrames, freqBins } = specInfo;
   const dims = outTensor.dims || [];
   const chCountInOut = dims.length >= 1 && dims[0] >= 2 ? 2 : 1;
+  const outData = outTensor.data;
   const totalFrames = stftObj.numFrames;
 
   const mRe = new Float32Array(stftObj.re.length);
@@ -358,7 +292,7 @@ function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength)
       if (sp < numSplits && b < freqBins) {
         const actualCh = chCountInOut >= 2 ? chIdx : 0;
         const outIdx = ((actualCh * numSplits + sp) * targetFrames + t) * freqBins + b;
-        const predVal = readOutputValue(outTensor, outIdx);
+        const predVal = outData[outIdx];
         if (typeof predVal === "number" && Number.isFinite(predVal)) {
           gain = origMag > 1e-6 ? Math.max(0, Math.min(2.0, predVal / origMag)) : 0;
         }
@@ -431,7 +365,7 @@ self.onmessage = async (e) => {
 
     postMessage({
       type: "progress",
-      message: "FP16 AIセッションを初期化中 (512フレーム仕様)...",
+      message: "AIセッションを初期化中 (512フレーム仕様)...",
     });
 
     session = await createSessionFromBytes(modelBytes);
