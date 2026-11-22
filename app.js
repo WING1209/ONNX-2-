@@ -1,9 +1,12 @@
-const APP_VERSION = "Ver.1.11";
+const APP_VERSION = "Ver.1.13";
 const TARGET_SAMPLE_RATE = 44100;
 
 // iOSのメモリピークを抑える軽量出力設定
 const OUTPUT_SAMPLE_RATE = 22050;
 const OUTPUT_CHANNELS = 1;
+
+// 1段階目のダウンロード処理開始時に不要なバックグラウンド／ページ参照を解放
+const RELEASE_BACKGROUND_ON_DOWNLOAD = true;
 
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
@@ -56,13 +59,13 @@ function isAllowedAudio(file) {
   return nameOk || typeOk;
 }
 
-function clearGeneratedAudio() {
-  if (currentBlobUrl) {
+function clearGeneratedAudio({ keepUrlBriefly = false } = {}) {
+  if (currentBlobUrl && !keepUrlBriefly) {
     try {
       URL.revokeObjectURL(currentBlobUrl);
     } catch (_) {}
-    currentBlobUrl = null;
   }
+  currentBlobUrl = null;
   currentAudioBlob = null;
   if (dlBtn) {
     dlBtn.disabled = true;
@@ -75,6 +78,45 @@ function terminateWorkerSafely() {
       worker.terminate();
     } catch (_) {}
     worker = null;
+  }
+}
+
+/**
+ * 1段階目のダウンロード要求が押された／走ったタイミングで
+ * バックグラウンドワーカーや不要な参照を解放する
+ */
+function releaseBackgroundMemoryOnDownload(urlToKeepBriefly = null) {
+  terminateWorkerSafely();
+  selectedFile = null;
+  currentAudioBlob = null;
+
+  if (fileInput) {
+    try {
+      fileInput.value = "";
+    } catch (_) {}
+  }
+
+  if (dlBtn) {
+    dlBtn.disabled = true;
+  }
+
+  if (urlToKeepBriefly) {
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(urlToKeepBriefly);
+      } catch (_) {}
+      if (currentBlobUrl === urlToKeepBriefly) {
+        currentBlobUrl = null;
+      }
+    }, 20000);
+  } else if (currentBlobUrl) {
+    const oldUrl = currentBlobUrl;
+    currentBlobUrl = null;
+    setTimeout(() => {
+      try {
+        URL.revokeObjectURL(oldUrl);
+      } catch (_) {}
+    }, 20000);
   }
 }
 
@@ -166,11 +208,23 @@ async function triggerDownloadOrShare({ isAuto = false } = {}) {
         type: "audio/wav",
       });
       if (typeof navigator.canShare !== "function" || navigator.canShare({ files: [wavFile] })) {
+        if (RELEASE_BACKGROUND_ON_DOWNLOAD) {
+          terminateWorkerSafely();
+          selectedFile = null;
+          if (fileInput) {
+            try {
+              fileInput.value = "";
+            } catch (_) {}
+          }
+        }
         await navigator.share({
           files: [wavFile],
           title: currentFileName,
         });
         statusEl.textContent = `共有メニューを開きました: ${currentFileName}`;
+        if (RELEASE_BACKGROUND_ON_DOWNLOAD) {
+          clearGeneratedAudio();
+        }
         return true;
       }
     } catch (shareErr) {
@@ -186,12 +240,11 @@ async function triggerDownloadOrShare({ isAuto = false } = {}) {
   }
 
   try {
-    if (!currentBlobUrl) {
-      currentBlobUrl = URL.createObjectURL(currentAudioBlob);
-    }
+    const urlToUse = currentBlobUrl || URL.createObjectURL(currentAudioBlob);
+    currentBlobUrl = urlToUse;
 
     const tempLink = document.createElement("a");
-    tempLink.href = currentBlobUrl;
+    tempLink.href = urlToUse;
     tempLink.download = currentFileName;
     tempLink.rel = "noopener";
     tempLink.style.display = "none";
@@ -200,8 +253,13 @@ async function triggerDownloadOrShare({ isAuto = false } = {}) {
     document.body.removeChild(tempLink);
 
     statusEl.textContent = isAuto
-      ? `自動保存を実行しました: ${currentFileName}（保存されない場合は「音声 保存」を押してください）`
-      : `保存処理を実行しました: ${currentFileName}`;
+      ? `ダウンロード要求を送信しました: ${currentFileName}（ポップアップの「ダウンロード」を押してください）`
+      : `ダウンロード要求を送信しました: ${currentFileName}`;
+
+    if (RELEASE_BACKGROUND_ON_DOWNLOAD) {
+      releaseBackgroundMemoryOnDownload(urlToUse);
+    }
+
     return true;
   } catch (err) {
     statusEl.textContent = isAuto
@@ -330,7 +388,7 @@ runBtn.addEventListener("click", async () => {
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
-    worker = new Worker("worker.js?v=1.11", { type: "module" });
+    worker = new Worker("worker.js?v=1.13", { type: "module" });
     attachWorkerHandlers(worker);
 
     statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
