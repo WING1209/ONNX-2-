@@ -1,9 +1,12 @@
-const APP_VERSION = "Ver.1.13";
+const APP_VERSION = "Ver.1.14";
 const TARGET_SAMPLE_RATE = 44100;
 
-// iOSのメモリピークを抑える軽量出力設定
+// クラッシュを抑えるための出力設定・区間上限
 const OUTPUT_SAMPLE_RATE = 22050;
 const OUTPUT_CHANNELS = 1;
+const DEFAULT_START_SEC = 0;
+const DEFAULT_DURATION_SEC = 45;
+const MAX_SLICE_SEC = 120;
 
 // 1段階目のダウンロード処理開始時に不要なバックグラウンド／ページ参照を解放
 const RELEASE_BACKGROUND_ON_DOWNLOAD = true;
@@ -14,6 +17,8 @@ const runBtn = document.getElementById("runBtn");
 const statusEl = document.getElementById("status");
 const dlBtn = document.getElementById("dl-accompaniment");
 const autoSaveToggle = document.getElementById("autoSaveToggle");
+const startSecInput = document.getElementById("startSecInput");
+const durationSecInput = document.getElementById("durationSecInput");
 
 let selectedFile = null;
 let currentAudioBlob = null;
@@ -39,6 +44,19 @@ if (autoSaveToggle) {
       ? "自動保存を ON にしました（抽出完了時に保存を試行します）。"
       : "自動保存を OFF にしました（完了後に「音声 保存」を押してください）。";
   });
+}
+
+function getSliceRangeSec() {
+  const rawStart = Number(startSecInput?.value ?? DEFAULT_START_SEC);
+  const rawDur = Number(durationSecInput?.value ?? DEFAULT_DURATION_SEC);
+
+  const startSec = Number.isFinite(rawStart) && rawStart >= 0 ? Math.floor(rawStart) : DEFAULT_START_SEC;
+  let durationSec = Number.isFinite(rawDur) && rawDur > 0 ? Math.floor(rawDur) : DEFAULT_DURATION_SEC;
+  if (durationSec > MAX_SLICE_SEC) {
+    durationSec = MAX_SLICE_SEC;
+    if (durationSecInput) durationSecInput.value = String(MAX_SLICE_SEC);
+  }
+  return { startSec, durationSec };
 }
 
 function isIosDevice() {
@@ -120,34 +138,42 @@ function yieldTick(ms = 25) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function normalizeTo44100Stereo(decodedBuffer) {
+async function extractNormalizedSlice(decodedBuffer, startSec, durationSec) {
   const numChannels = decodedBuffer.numberOfChannels;
   if (numChannels < 1) {
     throw new Error("有効な音声チャンネルが見つかりませんでした。");
   }
 
-  const needsResample = decodedBuffer.sampleRate !== TARGET_SAMPLE_RATE;
-  const needsChannelConvert = numChannels !== 2;
+  const totalDuration = decodedBuffer.duration;
+  const safeStart = Math.min(startSec, Math.max(0, totalDuration - 0.1));
+  const actualDur = Math.max(0.1, Math.min(durationSec, totalDuration - safeStart));
+  const targetLength = Math.max(1, Math.ceil(actualDur * TARGET_SAMPLE_RATE));
 
-  if (!needsResample && !needsChannelConvert) {
-    return decodedBuffer;
-  }
-
-  const targetLength = Math.ceil(decodedBuffer.duration * TARGET_SAMPLE_RATE);
   const offlineCtx = new OfflineAudioContext(2, targetLength, TARGET_SAMPLE_RATE);
+
+  const srcStartSample = Math.min(
+    decodedBuffer.length,
+    Math.max(0, Math.floor(safeStart * decodedBuffer.sampleRate))
+  );
+  const srcEndSample = Math.min(
+    decodedBuffer.length,
+    Math.max(srcStartSample + 1, Math.ceil((safeStart + actualDur) * decodedBuffer.sampleRate))
+  );
+  const sliceLen = srcEndSample - srcStartSample;
+
   const inputForRender = offlineCtx.createBuffer(
     Math.min(numChannels, 2),
-    decodedBuffer.length,
+    sliceLen,
     decodedBuffer.sampleRate
   );
 
+  for (let c = 0; c < Math.min(numChannels, 2); c++) {
+    const fullCh = decodedBuffer.getChannelData(c);
+    inputForRender.copyToChannel(fullCh.subarray(srcStartSample, srcEndSample), c);
+  }
   if (numChannels === 1) {
-    const mono = decodedBuffer.getChannelData(0);
-    inputForRender.copyToChannel(mono, 0);
-    inputForRender.copyToChannel(mono, 1);
-  } else {
-    inputForRender.copyToChannel(decodedBuffer.getChannelData(0), 0);
-    inputForRender.copyToChannel(decodedBuffer.getChannelData(1), 1);
+    const monoSlice = inputForRender.getChannelData(0);
+    inputForRender.copyToChannel(monoSlice, 1);
   }
 
   const source = offlineCtx.createBufferSource();
@@ -156,7 +182,14 @@ async function normalizeTo44100Stereo(decodedBuffer) {
   source.start(0);
   const rendered = await offlineCtx.startRendering();
   source.disconnect();
-  return rendered;
+
+  return {
+    left: new Float32Array(rendered.getChannelData(0)),
+    right: new Float32Array(rendered.getChannelData(1)),
+    sampleRate: rendered.sampleRate,
+    actualStartSec: Math.floor(safeStart),
+    actualEndSec: Math.ceil(safeStart + actualDur),
+  };
 }
 
 function buildOutputSamples(chL, chR, srcRate, dstRate, outChannels) {
@@ -265,7 +298,7 @@ async function triggerDownloadOrShare({ isAuto = false } = {}) {
   }
 }
 
-function attachWorkerHandlers(w) {
+function attachWorkerHandlers(w, baseName, startSec, endSec) {
   w.onmessage = async (e) => {
     const { type, message, accompaniment, sampleRate } = e.data;
 
@@ -299,6 +332,7 @@ function attachWorkerHandlers(w) {
             builtOut.rate
           );
           builtOut.channels = null;
+          currentFileName = `${baseName}_${startSec}-${endSec}s_accompaniment.wav`;
 
           if (dlBtn) {
             dlBtn.disabled = false;
@@ -336,14 +370,15 @@ fileInput.addEventListener("change", (e) => {
   if (!isAllowedAudio(file)) {
     selectedFile = null;
     runBtn.disabled = true;
-    fileSub.textContent = "対応形式: MP3 / WAV (44100Hz・ステレオへ自動変換)";
+    fileSub.textContent = "対応形式: MP3 / WAV (指定区間を抽出)";
     statusEl.textContent = "エラー: MP3 または WAVファイルのみ対応しています。";
     return;
   }
 
   selectedFile = file;
   const baseName = file.name.replace(/\.[^.]+$/, "") || "accompaniment";
-  currentFileName = `${baseName}_accompaniment.wav`;
+  const { startSec, durationSec } = getSliceRangeSec();
+  currentFileName = `${baseName}_${startSec}-${startSec + durationSec}s_accompaniment.wav`;
 
   runBtn.disabled = false;
   const mb = (file.size / 1024 / 1024).toFixed(2);
@@ -356,10 +391,15 @@ runBtn.addEventListener("click", async () => {
   runBtn.disabled = true;
   clearGeneratedAudio();
   terminateWorkerSafely();
-  statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
+
+  const fileRef = selectedFile;
+  const baseName = fileRef.name.replace(/\.[^.]+$/, "") || "accompaniment";
+  const { startSec, durationSec } = getSliceRangeSec();
+
+  statusEl.textContent = `ステップ1/3: ${startSec}秒〜${startSec + durationSec}秒の区間を抽出中...`;
 
   try {
-    const arrayBuffer = await selectedFile.arrayBuffer();
+    let arrayBuffer = await fileRef.arrayBuffer();
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioCtx = new AudioContextClass();
     let audioBuffer;
@@ -367,38 +407,30 @@ runBtn.addEventListener("click", async () => {
     try {
       audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
     } finally {
+      arrayBuffer = null;
       if (typeof audioCtx.close === "function") {
         await audioCtx.close().catch(() => {});
       }
     }
 
-    const needsConvert =
-      audioBuffer.sampleRate !== TARGET_SAMPLE_RATE ||
-      audioBuffer.numberOfChannels !== 2;
+    const sliced = await extractNormalizedSlice(audioBuffer, startSec, durationSec);
+    audioBuffer = null;
 
-    if (needsConvert) {
-      statusEl.textContent = `ステップ1/3: 44100Hz・ステレオに変換中... (元: ${audioBuffer.sampleRate}Hz / ${audioBuffer.numberOfChannels}ch)`;
-    }
+    worker = new Worker("worker.js?v=1.14-slice", { type: "module" });
+    attachWorkerHandlers(worker, baseName, sliced.actualStartSec, sliced.actualEndSec);
 
-    const normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
-    const left = new Float32Array(normalizedBuffer.getChannelData(0));
-    const right = new Float32Array(normalizedBuffer.getChannelData(1));
-
-    worker = new Worker("worker.js?v=1.13-fp16", { type: "module" });
-    attachWorkerHandlers(worker);
-
-    statusEl.textContent = "ステップ2/3: FP16モデル確認・伴奏抽出を開始中...";
+    statusEl.textContent = `ステップ2/3: ${sliced.actualStartSec}〜${sliced.actualEndSec}秒の伴奏抽出を開始中...`;
     worker.postMessage(
       {
-        sampleRate: normalizedBuffer.sampleRate,
-        left,
-        right,
+        sampleRate: sliced.sampleRate,
+        left: sliced.left,
+        right: sliced.right,
       },
-      [left.buffer, right.buffer]
+      [sliced.left.buffer, sliced.right.buffer]
     );
   } catch (err) {
     terminateWorkerSafely();
-    statusEl.textContent = `読み込み・変換エラー: ${err.message}`;
+    statusEl.textContent = `読み込み・切り出しエラー: ${err.message}`;
     runBtn.disabled = false;
   }
 });
