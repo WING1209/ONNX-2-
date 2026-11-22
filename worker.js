@@ -400,7 +400,7 @@ self.onmessage = async (e) => {
 
     postMessage({
       type: "progress",
-      message: "伴奏WAVデータを転送中...",
+      message: "伴奏データを転送中...",
     });
 
     postMessage(
