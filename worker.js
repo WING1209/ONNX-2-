@@ -20,6 +20,10 @@ const MODEL_FRAMES = 512;
 const MODEL_BINS = 1024;
 const BLOCK_SAMPLES = MODEL_FRAMES * HOP_LENGTH; // 524,288 サンプル (約11.89秒)
 
+// ブロック繋ぎ目の「ブツッ」というノイズを減らすクロスフェード長（32フレーム ≒ 約0.74秒）
+const CROSSFADE_SAMPLES = 32 * HOP_LENGTH; // 32,768 サンプル
+const STEP_SAMPLES = Math.max(HOP_LENGTH * 16, BLOCK_SAMPLES - CROSSFADE_SAMPLES);
+
 // 一定ブロックごとにセッションを解放・再生成して iOS の WASM ヒープ膨張を抑制
 const SESSION_RECYCLE_BLOCKS = 6;
 
@@ -302,6 +306,44 @@ function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength)
   return computeIstft(mRe, mIm, totalFrames, outputLength);
 }
 
+/**
+ * ブロックのオーバーラップ区間をコサイン曲線で滑らかにクロスフェードして繋ぐ
+ */
+function writeBlockWithCrossfade(dstLeft, dstRight, outL, outR, start, totalLength, blockIdx, totalBlocks) {
+  const len = Math.min(outL.length, outR.length);
+  const hasPrevBlock = blockIdx > 0;
+  const hasNextBlock = blockIdx < totalBlocks - 1;
+  const fadeLen = Math.min(CROSSFADE_SAMPLES, Math.floor(len / 3));
+
+  for (let i = 0; i < len; i++) {
+    const outIdx = start + i;
+    if (outIdx >= totalLength) break;
+
+    let sampleL = outL[i];
+    let sampleR = outR[i];
+
+    // 前ブロックとの重なり区間（先頭 fadeLen サンプル）を滑らかにフェードイン
+    if (hasPrevBlock && fadeLen > 0 && i < fadeLen) {
+      const t = i / fadeLen;
+      const wIn = 0.5 * (1 - Math.cos(Math.PI * t));
+      const wPrev = 1 - wIn;
+      sampleL = dstLeft[outIdx] * wPrev + sampleL * wIn;
+      sampleR = dstRight[outIdx] * wPrev + sampleR * wIn;
+    }
+
+    // 次ブロックと重なる末尾区間（末尾 fadeLen サンプル）は、まだ次ブロックが来ていないのでそのまま置くかフェードアウト
+    if (hasNextBlock && fadeLen > 0 && i >= len - fadeLen) {
+      const t = (i - (len - fadeLen)) / fadeLen;
+      const wOut = 0.5 * (1 + Math.cos(Math.PI * t));
+      dstLeft[outIdx] = sampleL * wOut;
+      dstRight[outIdx] = sampleR * wOut;
+    } else {
+      dstLeft[outIdx] = sampleL;
+      dstRight[outIdx] = sampleR;
+    }
+  }
+}
+
 function clampBuffer(buf) {
   for (let i = 0; i < buf.length; i++) {
     if (buf[i] > 1) buf[i] = 1;
@@ -335,7 +377,7 @@ self.onmessage = async (e) => {
     const inputName = session.inputNames[0];
     const outputName = session.outputNames[0];
 
-    const totalBlocks = Math.max(1, Math.ceil(totalLength / BLOCK_SAMPLES));
+    const totalBlocks = Math.max(1, Math.ceil(totalLength / STEP_SAMPLES));
 
     for (let blockIdx = 0; blockIdx < totalBlocks; blockIdx++) {
       if (blockIdx > 0 && blockIdx % SESSION_RECYCLE_BLOCKS === 0) {
@@ -349,7 +391,9 @@ self.onmessage = async (e) => {
         session = await createSessionFromBytes(modelBytes);
       }
 
-      const start = blockIdx * BLOCK_SAMPLES;
+      const start = blockIdx * STEP_SAMPLES;
+      if (start >= totalLength) break;
+
       const end = Math.min(totalLength, start + BLOCK_SAMPLES);
       const pct = Math.round(((blockIdx + 1) / totalBlocks) * 100);
 
@@ -383,8 +427,16 @@ self.onmessage = async (e) => {
       leftStft = null;
       rightStft = null;
 
-      dstLeft.set(outL, start);
-      dstRight.set(outR, start);
+      writeBlockWithCrossfade(
+        dstLeft,
+        dstRight,
+        outL,
+        outR,
+        start,
+        totalLength,
+        blockIdx,
+        totalBlocks
+      );
 
       if (blockIdx < totalBlocks - 1) {
         await yieldForGC(80);
