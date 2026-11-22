@@ -1,13 +1,13 @@
 const TARGET_SAMPLE_RATE = 44100;
-const STEM_KEYS = ["vocals", "accompaniment"];
 
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
 const runBtn = document.getElementById("runBtn");
 const statusEl = document.getElementById("status");
+const dlLink = document.getElementById("dl-accompaniment");
 
 let selectedFile = null;
-const worker = new Worker("worker.js", { type: "module" });
+const worker = new Worker("worker.js?v=3", { type: "module" });
 
 function isAllowedAudio(file) {
   if (!file) return false;
@@ -22,17 +22,13 @@ function isAllowedAudio(file) {
   return nameOk || typeOk;
 }
 
-function resetDownloadLinks() {
-  STEM_KEYS.forEach((k) => {
-    const link = document.getElementById(`dl-${k}`);
-    if (link) {
-      if (link.href && link.href.startsWith("blob:")) {
-        URL.revokeObjectURL(link.href);
-      }
-      link.classList.add("disabled");
-      link.removeAttribute("href");
-    }
-  });
+function resetDownloadLink() {
+  if (!dlLink) return;
+  if (dlLink.href && dlLink.href.startsWith("blob:")) {
+    URL.revokeObjectURL(dlLink.href);
+  }
+  dlLink.classList.add("disabled");
+  dlLink.removeAttribute("href");
 }
 
 async function normalizeTo44100Stereo(decodedBuffer) {
@@ -76,7 +72,7 @@ async function normalizeTo44100Stereo(decodedBuffer) {
 
 fileInput.addEventListener("change", (e) => {
   const file = e.target.files?.[0];
-  resetDownloadLinks();
+  resetDownloadLink();
 
   if (!isAllowedAudio(file)) {
     selectedFile = null;
@@ -90,13 +86,13 @@ fileInput.addEventListener("change", (e) => {
   runBtn.disabled = false;
   const mb = (file.size / 1024 / 1024).toFixed(2);
   fileSub.textContent = `${file.name} (${mb} MB)`;
-  statusEl.textContent = `選択完了: ${file.name} - 「2 パート分離を実行！」を押してください。`;
+  statusEl.textContent = `選択完了: ${file.name} - 「伴奏抽出を実行！」を押してください。`;
 });
 
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
-  resetDownloadLinks();
+  resetDownloadLink();
   statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
@@ -125,7 +121,7 @@ runBtn.addEventListener("click", async () => {
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
-    statusEl.textContent = "ステップ2/3: モデル確認・パート別分離を開始中...";
+    statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
     worker.postMessage(
       {
         sampleRate: normalizedBuffer.sampleRate,
@@ -179,26 +175,22 @@ function encodeWav(chL, chR, sampleRate) {
 }
 
 worker.onmessage = (e) => {
-  const { type, message, stems, sampleRate } = e.data;
+  const { type, message, accompaniment, sampleRate } = e.data;
 
   if (type === "progress") {
     statusEl.textContent = message;
   } else if (type === "done") {
-    statusEl.textContent = "ステップ3/3: WAVファイルを順次生成中...";
+    statusEl.textContent = "ステップ3/3: 伴奏WAVファイルを生成中...";
 
-    for (const k of STEM_KEYS) {
-      const link = document.getElementById(`dl-${k}`);
-      if (link && stems?.[k]) {
-        const blob = encodeWav(stems[k].left, stems[k].right, sampleRate);
-        link.href = URL.createObjectURL(blob);
-        link.classList.remove("disabled");
-        // 生成済みの配列参照を順次解放してメモリ圧迫を軽減
-        stems[k].left = null;
-        stems[k].right = null;
-      }
+    if (dlLink && accompaniment) {
+      const blob = encodeWav(accompaniment.left, accompaniment.right, sampleRate);
+      dlLink.href = URL.createObjectURL(blob);
+      dlLink.classList.remove("disabled");
+      accompaniment.left = null;
+      accompaniment.right = null;
     }
 
-    statusEl.textContent = "完了! 2パートそれぞれのWAVを保存できます。";
+    statusEl.textContent = "完了! 伴奏WAVを保存できます。";
     runBtn.disabled = false;
   } else if (type === "error") {
     statusEl.textContent = `分離エラー: ${message || "処理中にエラーが発生しました。"}`;
