@@ -153,11 +153,11 @@ input[type="file"] {
   gap: 12px;
 }
 .stem {
-  padding: 13px 14px;
+  padding: 14px 16px;
   border-radius: 18px;
-  background: #ffffff;
+  background: #f0f9ff;
   border: 2.5px solid #1e1b4b;
-  border-left-width: 9px;
+  border-left: 9px solid #0ea5e9;
   box-shadow: 4px 4px 0px #1e1b4b;
   display: flex;
   justify-content: space-between;
@@ -166,16 +166,8 @@ input[type="file"] {
 }
 .stem-name {
   font-weight: 900;
-  font-size: 0.96rem;
+  font-size: 0.98rem;
   color: #1e1b4b;
-}
-.stem-vocals {
-  border-left-color: #ec4899;
-  background: #fdf2f8;
-}
-.stem-accompaniment {
-  border-left-color: #0ea5e9;
-  background: #f0f9ff;
 }
 .stem a {
   color: #ffffff;
@@ -183,9 +175,9 @@ input[type="file"] {
   border: 2px solid #1e1b4b;
   box-shadow: 3px 3px 0px #1e1b4b;
   text-decoration: none;
-  font-size: 0.85rem;
+  font-size: 0.88rem;
   font-weight: 800;
-  padding: 8px 13px;
+  padding: 9px 14px;
   border-radius: 12px;
   white-space: nowrap;
   transition: transform 0.1s ease, box-shadow 0.1s ease;
@@ -215,19 +207,15 @@ input[type="file"] {
     <span class="file-sub" id="fileSub">対応形式: MP3 / WAV (44100Hz・ステレオ)</span>
   </label>
   <input type="file" id="audioFile" accept=".mp3, .wav, audio/mpeg, audio/wav">
-  <button id="runBtn" class="btn" disabled>🚀 2 パート分離を実行！</button>
+  <button id="runBtn" class="btn" disabled>🎸 伴奏抽出を実行！</button>
   <div id="status" class="status">MP3 または WAVファイルを選択してください。</div>
   <div id="results">
-    <div class="stem stem-vocals">
-      <span class="stem-name">🎤 ① ボーカル (Vocals)</span>
-      <a id="dl-vocals" class="disabled" download="vocals.wav">WAV 保存</a>
-    </div>
-    <div class="stem stem-accompaniment">
-      <span class="stem-name">🎸 ② 伴奏 (Accompaniment)</span>
+    <div class="stem">
+      <span class="stem-name">🎸 伴奏 (Accompaniment)</span>
       <a id="dl-accompaniment" class="disabled" download="accompaniment.wav">WAV 保存</a>
     </div>
   </div>
 </div>
-<script type="module" src="app.js?v=2"></script>
+<script type="module" src="app.js?v=3"></script>
 </body>
 </html>
