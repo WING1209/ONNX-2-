@@ -1,10 +1,16 @@
-import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.mjs";
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.mjs";
 
 // iOS Safari でのクラッシュ・WASMメモリ膨張を抑える設定
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 ort.env.wasm.simd = false;
-ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
+
+// まず同一オリジン(./wasm/)を試し、なければ CDN を利用
+const LOCAL_WASM_PATH = "./wasm/";
+const CDN_WASM_PATHS = [
+  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/",
+  "https://unpkg.com/onnxruntime-web@1.18.0/dist/",
+];
 
 const ACCOMPANIMENT_MODEL_URL =
   "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems-fp16/resolve/main/accompaniment.fp16.onnx?download=true";
@@ -96,7 +102,7 @@ async function fetchWithRetry(url, retries = 3) {
   let lastErr = null;
   for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(url);
       if (!response.ok) {
         throw new Error(`HTTP ${response.status}`);
       }
@@ -151,15 +157,28 @@ async function loadAccompanimentModelBytes() {
   return new Uint8Array(buf);
 }
 
+async function hasLocalWasmBinary() {
+  try {
+    const res = await fetch(`${LOCAL_WASM_PATH}ort-wasm-simd-threaded.wasm`, {
+      method: "HEAD",
+    });
+    return res.ok;
+  } catch (_) {
+    return false;
+  }
+}
+
 async function createSessionFromBytes(modelBytes, retries = 3) {
   let lastErr = null;
-  const cdnCandidates = [
-    "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/",
-    "https://unpkg.com/onnxruntime-web@1.19.2/dist/",
-  ];
+  const candidates = [];
+
+  if (await hasLocalWasmBinary()) {
+    candidates.push(LOCAL_WASM_PATH);
+  }
+  candidates.push(...CDN_WASM_PATHS);
 
   for (let attempt = 1; attempt <= retries; attempt++) {
-    ort.env.wasm.wasmPaths = cdnCandidates[(attempt - 1) % cdnCandidates.length];
+    ort.env.wasm.wasmPaths = candidates[(attempt - 1) % candidates.length];
     try {
       return await ort.InferenceSession.create(modelBytes, {
         executionProviders: ["wasm"],
@@ -174,7 +193,7 @@ async function createSessionFromBytes(modelBytes, retries = 3) {
           type: "progress",
           message: `WASM初期化を再試行中 (${attempt}/${retries})...`,
         });
-        await yieldForGC(500 * attempt);
+        await yieldForGC(600 * attempt);
       }
     }
   }
