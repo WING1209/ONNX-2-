@@ -1,5 +1,7 @@
-const APP_VERSION = "Ver.1.7";
+const APP_VERSION = "Ver.1.8";
 const TARGET_SAMPLE_RATE = 44100;
+// iOSメモリ節約のため保存WAVを22050Hzに設定（44100Hzにしたい場合は 44100 に変更可能）
+const OUTPUT_SAMPLE_RATE = 22050;
 
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
@@ -11,8 +13,7 @@ let selectedFile = null;
 let currentAudioBlob = null;
 let currentBlobUrl = null;
 let currentFileName = "accompaniment.wav";
-
-const worker = new Worker("worker.js?v=1.7", { type: "module" });
+let worker = null;
 
 function isIosDevice() {
   const ua = navigator.userAgent || "";
@@ -45,7 +46,16 @@ function clearGeneratedAudio() {
   }
 }
 
-function yieldTick(ms = 20) {
+function terminateWorkerSafely() {
+  if (worker) {
+    try {
+      worker.terminate();
+    } catch (_) {}
+    worker = null;
+  }
+}
+
+function yieldTick(ms = 25) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -88,6 +98,91 @@ async function normalizeTo44100Stereo(decodedBuffer) {
   return rendered;
 }
 
+function resampleLinearStereo(chL, chR, srcRate, dstRate) {
+  if (srcRate === dstRate || chL.length === 0) {
+    return { outL: chL, outR: chR, rate: srcRate };
+  }
+
+  const ratio = srcRate / dstRate;
+  const outLen = Math.max(1, Math.floor(chL.length / ratio));
+  const outL = new Float32Array(outLen);
+  const outR = new Float32Array(outLen);
+
+  for (let i = 0; i < outLen; i++) {
+    const srcPos = i * ratio;
+    const idx0 = Math.floor(srcPos);
+    const idx1 = Math.min(chL.length - 1, idx0 + 1);
+    const frac = srcPos - idx0;
+
+    outL[i] = chL[idx0] * (1 - frac) + chL[idx1] * frac;
+    outR[i] = chR[idx0] * (1 - frac) + chR[idx1] * frac;
+  }
+
+  return { outL, outR, rate: dstRate };
+}
+
+function attachWorkerHandlers(w) {
+  w.onmessage = async (e) => {
+    const { type, message, accompaniment, sampleRate } = e.data;
+
+    if (type === "progress") {
+      statusEl.textContent = message;
+    } else if (type === "done") {
+      // 抽出完了後にワーカーを終了して WASM ヒープを早めに解放
+      terminateWorkerSafely();
+      statusEl.textContent = "ステップ3/3: 音声ファイルを生成中...";
+
+      try {
+        await yieldTick(50);
+
+        if (accompaniment) {
+          let chL = accompaniment.left;
+          let chR = accompaniment.right;
+          accompaniment.left = null;
+          accompaniment.right = null;
+
+          const resampled = resampleLinearStereo(
+            chL,
+            chR,
+            sampleRate || TARGET_SAMPLE_RATE,
+            OUTPUT_SAMPLE_RATE
+          );
+          chL = null;
+          chR = null;
+
+          currentAudioBlob = await encodeWavBlobChunked(
+            resampled.outL,
+            resampled.outR,
+            resampled.rate
+          );
+          resampled.outL = null;
+          resampled.outR = null;
+
+          if (dlBtn) {
+            dlBtn.disabled = false;
+          }
+        }
+
+        statusEl.textContent = "完了! 「音声 保存」を押して保存してください。";
+      } catch (err) {
+        statusEl.textContent = `音声生成エラー: ${err.message}`;
+      } finally {
+        runBtn.disabled = false;
+      }
+    } else if (type === "error") {
+      terminateWorkerSafely();
+      statusEl.textContent = `分離エラー: ${message || "処理中にエラーが発生しました。"}`;
+      runBtn.disabled = false;
+    }
+  };
+
+  w.onerror = (err) => {
+    terminateWorkerSafely();
+    statusEl.textContent = `ワーカーエラー: ${err.message || "予期しないエラーが発生しました。"}`;
+    runBtn.disabled = false;
+  };
+}
+
 fileInput.addEventListener("change", (e) => {
   const file = e.target.files?.[0];
   clearGeneratedAudio();
@@ -114,6 +209,7 @@ runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
   clearGeneratedAudio();
+  terminateWorkerSafely();
   statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
@@ -142,6 +238,9 @@ runBtn.addEventListener("click", async () => {
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
+    worker = new Worker("worker.js?v=1.8", { type: "module" });
+    attachWorkerHandlers(worker);
+
     statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
     worker.postMessage(
       {
@@ -152,6 +251,7 @@ runBtn.addEventListener("click", async () => {
       [left.buffer, right.buffer]
     );
   } catch (err) {
+    terminateWorkerSafely();
     statusEl.textContent = `読み込み・変換エラー: ${err.message}`;
     runBtn.disabled = false;
   }
@@ -184,7 +284,7 @@ async function encodeWavBlobChunked(chL, chR, sampleRate) {
   headerView.setUint32(40, length * numChannels * 2, true);
 
   const parts = [headerBuf];
-  const chunkSamples = 44100 * 10; // 10秒単位で分割生成
+  const chunkSamples = Math.max(1, sampleRate * 4); // 約4秒単位で分割生成
 
   for (let start = 0; start < length; start += chunkSamples) {
     const end = Math.min(length, start + chunkSamples);
@@ -202,7 +302,7 @@ async function encodeWavBlobChunked(chL, chR, sampleRate) {
     }
 
     parts.push(segBuf);
-    await yieldTick(10);
+    await yieldTick(15);
   }
 
   return new Blob(parts, { type: "audio/wav" });
@@ -254,44 +354,3 @@ dlBtn.addEventListener("click", async () => {
     statusEl.textContent = `ダウンロードエラー: ${err.message}`;
   }
 });
-
-worker.onmessage = async (e) => {
-  const { type, message, accompaniment, sampleRate } = e.data;
-
-  if (type === "progress") {
-    statusEl.textContent = message;
-  } else if (type === "done") {
-    statusEl.textContent = "ステップ3/3: 音声ファイルを生成中...";
-
-    try {
-      await yieldTick(30);
-
-      if (accompaniment) {
-        const chL = accompaniment.left;
-        const chR = accompaniment.right;
-        accompaniment.left = null;
-        accompaniment.right = null;
-
-        currentAudioBlob = await encodeWavBlobChunked(chL, chR, sampleRate);
-
-        if (dlBtn) {
-          dlBtn.disabled = false;
-        }
-      }
-
-      statusEl.textContent = "完了! 「音声 保存」を押して保存してください。";
-    } catch (err) {
-      statusEl.textContent = `音声生成エラー: ${err.message}`;
-    } finally {
-      runBtn.disabled = false;
-    }
-  } else if (type === "error") {
-    statusEl.textContent = `分離エラー: ${message || "処理中にエラーが発生しました。"}`;
-    runBtn.disabled = false;
-  }
-};
-
-worker.onerror = (err) => {
-  statusEl.textContent = `ワーカーエラー: ${err.message || "予期しないエラーが発生しました。"}`;
-  runBtn.disabled = false;
-};
