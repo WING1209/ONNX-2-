@@ -20,7 +20,13 @@ const autoSaveToggle = document.getElementById("autoSaveToggle");
 const startSecInput = document.getElementById("startSecInput");
 const durationSecInput = document.getElementById("durationSecInput");
 
+const mergeFilesInput = document.getElementById("mergeFilesInput");
+const mergePickSub = document.getElementById("mergePickSub");
+const mergeFileList = document.getElementById("mergeFileList");
+const mergeBtn = document.getElementById("mergeBtn");
+
 let selectedFile = null;
+let selectedMergeFiles = [];
 let currentAudioBlob = null;
 let currentBlobUrl = null;
 let currentFileName = "accompaniment.wav";
@@ -41,7 +47,7 @@ if (autoSaveToggle) {
     autoSaveEnabled = !autoSaveEnabled;
     updateAutoSaveUi();
     statusEl.textContent = autoSaveEnabled
-      ? "自動保存を ON にしました（各区間の完了時に保存を試行します）。"
+      ? "自動保存を ON にしました（完了時に保存を試行します）。"
       : "自動保存を OFF にしました（完了後に「音声 保存」を押してください）。";
   });
 }
@@ -78,6 +84,33 @@ function buildAutoSegments(totalDurationSec, startSec, stepDurationSec) {
     curStart = curEnd;
   }
   return segments;
+}
+
+function extractStartSecFromName(fileName) {
+  const match = fileName.match(/(?:^|[_-])(\d+)-(\d+)s/i);
+  if (match) {
+    return Number(match[1]);
+  }
+  return Number.MAX_SAFE_INTEGER;
+}
+
+function sortMergeFiles(files) {
+  return [...files].sort((a, b) => {
+    const startA = extractStartSecFromName(a.name);
+    const startB = extractStartSecFromName(b.name);
+    if (startA !== startB) return startA - startB;
+    return a.name.localeCompare(b.name, "ja");
+  });
+}
+
+function renderMergeFileList(files) {
+  if (!mergeFileList) return;
+  mergeFileList.innerHTML = "";
+  files.forEach((f, idx) => {
+    const li = document.createElement("li");
+    li.textContent = `${idx + 1}. ${f.name} (${(f.size / 1024).toFixed(1)} KB)`;
+    mergeFileList.appendChild(li);
+  });
 }
 
 function isIosDevice() {
@@ -158,6 +191,34 @@ function releaseSegmentMemoryAfterSave(urlToKeepBriefly = null, isFinalSegment =
 
 function yieldTick(ms = 30) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function decodeFileToMonoResampled(file, targetRate) {
+  let arrayBuffer = await file.arrayBuffer();
+  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+  const audioCtx = new AudioContextClass();
+  let decodedBuffer = null;
+
+  try {
+    decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
+  } finally {
+    arrayBuffer = null;
+    if (typeof audioCtx.close === "function") {
+      await audioCtx.close().catch(() => {});
+    }
+  }
+
+  const length = Math.max(1, Math.ceil(decodedBuffer.duration * targetRate));
+  const offlineCtx = new OfflineAudioContext(1, length, targetRate);
+  const src = offlineCtx.createBufferSource();
+  src.buffer = decodedBuffer;
+  src.connect(offlineCtx.destination);
+  src.start(0);
+  const rendered = await offlineCtx.startRendering();
+  src.disconnect();
+  decodedBuffer = null;
+
+  return new Float32Array(rendered.getChannelData(0));
 }
 
 async function extractNormalizedSlice(decodedBuffer, startSec, endSec) {
@@ -298,7 +359,7 @@ async function triggerDownloadOrShare({ isAuto = false, isFinalSegment = false }
       : `ダウンロード要求を送信しました: ${currentFileName}`;
 
     if (RELEASE_BACKGROUND_ON_DOWNLOAD) {
-      releaseSegmentMemoryAfterSave(urlToUse, isFinalSegment);
+      releaseSegmentMemoryAfterSave(urlToKeepBriefly, isFinalSegment);
     }
 
     return true;
@@ -313,7 +374,7 @@ async function triggerDownloadOrShare({ isAuto = false, isFinalSegment = false }
 function runWorkerForSegment(sampleRate, left, right, segIndex, totalSegments, segLabel) {
   return new Promise((resolve, reject) => {
     terminateWorkerSafely();
-    const w = new Worker("worker.js?v=1.14-fp16-auto", { type: "module" });
+    const w = new Worker("worker.js?v=1.14-fp16-merge", { type: "module" });
     worker = w;
 
     w.onmessage = (e) => {
@@ -375,6 +436,7 @@ fileInput.addEventListener("change", (e) => {
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
+  if (mergeBtn) mergeBtn.disabled = true;
   clearGeneratedAudio();
   terminateWorkerSafely();
 
@@ -422,7 +484,6 @@ runBtn.addEventListener("click", async () => {
         segLabel
       );
 
-      // 入力スライスを即座に解放
       sliced.left = null;
       sliced.right = null;
       sliced = null;
@@ -479,9 +540,99 @@ runBtn.addEventListener("click", async () => {
     statusEl.textContent = `処理エラー: ${err.message}`;
   } finally {
     audioBuffer = null;
-    runBtn.disabled = false;
+    runBtn.disabled = !selectedFile;
+    if (mergeBtn) mergeBtn.disabled = selectedMergeFiles.length < 2;
   }
 });
+
+if (mergeFilesInput) {
+  mergeFilesInput.addEventListener("change", (e) => {
+    const rawFiles = Array.from(e.target.files || []).filter(isAllowedAudio);
+    clearGeneratedAudio();
+
+    if (rawFiles.length < 2) {
+      selectedMergeFiles = [];
+      renderMergeFileList([]);
+      if (mergePickSub) {
+        mergePickSub.textContent = "0-45s / 45-90s などのファイルをまとめて選択（秒数順に自動整列）";
+      }
+      if (mergeBtn) mergeBtn.disabled = true;
+      statusEl.textContent = "統合するには細切れファイルを2つ以上選択してください。";
+      return;
+    }
+
+    selectedMergeFiles = sortMergeFiles(rawFiles);
+    renderMergeFileList(selectedMergeFiles);
+    if (mergePickSub) {
+      mergePickSub.textContent = `${selectedMergeFiles.length} 個のファイルをロード済み`;
+    }
+    if (mergeBtn) mergeBtn.disabled = false;
+    statusEl.textContent = `${selectedMergeFiles.length} 個の細切れファイルを読み込みました。「選択したファイルを1つに統合！」を押してください。`;
+  });
+}
+
+if (mergeBtn) {
+  mergeBtn.addEventListener("click", async () => {
+    if (selectedMergeFiles.length < 2) return;
+
+    mergeBtn.disabled = true;
+    runBtn.disabled = true;
+    clearGeneratedAudio();
+    terminateWorkerSafely();
+
+    const partsMono = [];
+
+    try {
+      let totalSamples = 0;
+
+      for (let i = 0; i < selectedMergeFiles.length; i++) {
+        const f = selectedMergeFiles[i];
+        statusEl.textContent = `統合準備中 (${i + 1}/${selectedMergeFiles.length}): ${f.name} をデコード中...`;
+        const monoSamples = await decodeFileToMonoResampled(f, OUTPUT_SAMPLE_RATE);
+        partsMono.push(monoSamples);
+        totalSamples += monoSamples.length;
+        await yieldTick(25);
+      }
+
+      statusEl.textContent = "細切れデータを1本の音声に結合中...";
+      await yieldTick(25);
+
+      let mergedMono = new Float32Array(Math.max(1, totalSamples));
+      let writePos = 0;
+      for (let i = 0; i < partsMono.length; i++) {
+        const seg = partsMono[i];
+        mergedMono.set(seg, writePos);
+        writePos += seg.length;
+        partsMono[i] = null;
+      }
+      partsMono.length = 0;
+
+      statusEl.textContent = "統合WAVファイルを生成中...";
+      currentAudioBlob = await encodeWavBlobChunked([mergedMono], OUTPUT_SAMPLE_RATE);
+      mergedMono = null;
+
+      const firstNameBase =
+        selectedMergeFiles[0].name.replace(/(_\d+-\d+s.*)?\.[^.]+$/i, "") || "merged";
+      currentFileName = `${firstNameBase}_merged_accompaniment.wav`;
+
+      if (dlBtn) {
+        dlBtn.disabled = false;
+      }
+
+      if (autoSaveEnabled) {
+        await triggerDownloadOrShare({ isAuto: true, isFinalSegment: false });
+      } else {
+        statusEl.textContent = `統合完了 (${currentFileName})! 「音声 保存」を押して保存してください。`;
+      }
+    } catch (err) {
+      partsMono.length = 0;
+      statusEl.textContent = `統合エラー: ${err.message}`;
+    } finally {
+      mergeBtn.disabled = selectedMergeFiles.length < 2;
+      runBtn.disabled = !selectedFile;
+    }
+  });
+}
 
 async function encodeWavBlobChunked(channels, sampleRate) {
   const numChannels = channels.length;
