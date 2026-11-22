@@ -24,8 +24,8 @@ const BLOCK_SAMPLES = MODEL_FRAMES * HOP_LENGTH; // 524,288 サンプル (約11.
 const CROSSFADE_SAMPLES = 32 * HOP_LENGTH; // 32,768 サンプル
 const STEP_SAMPLES = Math.max(HOP_LENGTH * 16, BLOCK_SAMPLES - CROSSFADE_SAMPLES);
 
-// 一定ブロックごとにセッションを解放・再生成して iOS の WASM ヒープ膨張を抑制
-const SESSION_RECYCLE_BLOCKS = 6;
+// 4ブロックごとにセッションを解放・再生成して iOS の WASM ヒープ膨張を抑制
+const SESSION_RECYCLE_BLOCKS = 4;
 
 function createPeriodicHannWindow(length) {
   const win = new Float32Array(length);
@@ -346,7 +346,7 @@ function clampBuffer(buf) {
   }
 }
 
-function yieldForGC(ms = 80) {
+function yieldForGC(ms = 90) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -382,7 +382,7 @@ self.onmessage = async (e) => {
         });
         await releaseSession(session);
         session = null;
-        await yieldForGC(120);
+        await yieldForGC(140);
         session = await createSessionFromBytes(modelBytes);
       }
 
@@ -434,7 +434,7 @@ self.onmessage = async (e) => {
       );
 
       if (blockIdx < totalBlocks - 1) {
-        await yieldForGC(80);
+        await yieldForGC(90);
       }
     }
 
