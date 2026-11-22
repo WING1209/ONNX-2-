@@ -1,25 +1,42 @@
-const APP_VERSION = "Ver.1.10";
+const APP_VERSION = "Ver.1.11";
 const TARGET_SAMPLE_RATE = 44100;
 
 // iOSのメモリピークを抑える軽量出力設定
 const OUTPUT_SAMPLE_RATE = 22050;
 const OUTPUT_CHANNELS = 1;
 
-// ブラウザのユーザー操作制約があるため、通常は false（完了後ボタン点灯→タップで保存）を推奨
-// 必要に応じて true にすると完了直後に自動ダウンロード試行を行います
-const AUTO_TRIGGER_DOWNLOAD_ON_DONE = false;
-
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
 const runBtn = document.getElementById("runBtn");
 const statusEl = document.getElementById("status");
 const dlBtn = document.getElementById("dl-accompaniment");
+const autoSaveToggle = document.getElementById("autoSaveToggle");
 
 let selectedFile = null;
 let currentAudioBlob = null;
 let currentBlobUrl = null;
 let currentFileName = "accompaniment.wav";
 let worker = null;
+let autoSaveEnabled = true;
+
+function updateAutoSaveUi() {
+  if (!autoSaveToggle) return;
+  autoSaveToggle.textContent = autoSaveEnabled ? "ON" : "OFF";
+  autoSaveToggle.setAttribute("aria-pressed", String(autoSaveEnabled));
+  autoSaveToggle.classList.toggle("is-on", autoSaveEnabled);
+  autoSaveToggle.classList.toggle("is-off", !autoSaveEnabled);
+}
+
+if (autoSaveToggle) {
+  updateAutoSaveUi();
+  autoSaveToggle.addEventListener("click", () => {
+    autoSaveEnabled = !autoSaveEnabled;
+    updateAutoSaveUi();
+    statusEl.textContent = autoSaveEnabled
+      ? "自動保存を ON にしました（抽出完了時に保存を試行します）。"
+      : "自動保存を OFF にしました（完了後に「音声 保存」を押してください）。";
+  });
+}
 
 function isIosDevice() {
   const ua = navigator.userAgent || "";
@@ -137,13 +154,13 @@ function buildOutputSamples(chL, chR, srcRate, dstRate, outChannels) {
   return { channels: [outL, outR], rate: dstRate };
 }
 
-async function triggerDownloadOrShare(allowShareSheet = true) {
+async function triggerDownloadOrShare({ isAuto = false } = {}) {
   if (!currentAudioBlob || currentAudioBlob.size <= 44) {
     statusEl.textContent = "保存できる音声データがありません。";
-    return;
+    return false;
   }
 
-  if (allowShareSheet && isIosDevice() && typeof navigator.share === "function") {
+  if (isIosDevice() && typeof navigator.share === "function") {
     try {
       const wavFile = new File([currentAudioBlob], currentFileName, {
         type: "audio/wav",
@@ -154,12 +171,16 @@ async function triggerDownloadOrShare(allowShareSheet = true) {
           title: currentFileName,
         });
         statusEl.textContent = `共有メニューを開きました: ${currentFileName}`;
-        return;
+        return true;
       }
     } catch (shareErr) {
       if (shareErr?.name === "AbortError") {
-        statusEl.textContent = "保存をキャンセルしました。";
-        return;
+        statusEl.textContent = "保存をキャンセルしました。「音声 保存」から再試行できます。";
+        return false;
+      }
+      if (isAuto) {
+        statusEl.textContent = "自動共有はブロックされました。「音声 保存」を押して保存してください。";
+        return false;
       }
     }
   }
@@ -178,9 +199,15 @@ async function triggerDownloadOrShare(allowShareSheet = true) {
     tempLink.click();
     document.body.removeChild(tempLink);
 
-    statusEl.textContent = `保存処理を実行しました: ${currentFileName}`;
+    statusEl.textContent = isAuto
+      ? `自動保存を実行しました: ${currentFileName}（保存されない場合は「音声 保存」を押してください）`
+      : `保存処理を実行しました: ${currentFileName}`;
+    return true;
   } catch (err) {
-    statusEl.textContent = `ダウンロードエラー: ${err.message}`;
+    statusEl.textContent = isAuto
+      ? "自動保存がブロックされました。「音声 保存」を押して保存してください。"
+      : `ダウンロードエラー: ${err.message}`;
+    return false;
   }
 }
 
@@ -224,10 +251,10 @@ function attachWorkerHandlers(w) {
           }
         }
 
-        statusEl.textContent = "完了! 「音声 保存」を押して保存してください。";
-
-        if (AUTO_TRIGGER_DOWNLOAD_ON_DONE && dlBtn && !dlBtn.disabled) {
-          await triggerDownloadOrShare(false);
+        if (autoSaveEnabled && dlBtn && !dlBtn.disabled) {
+          await triggerDownloadOrShare({ isAuto: true });
+        } else {
+          statusEl.textContent = "完了! 「音声 保存」を押して保存してください。";
         }
       } catch (err) {
         statusEl.textContent = `音声生成エラー: ${err.message}`;
@@ -303,7 +330,7 @@ runBtn.addEventListener("click", async () => {
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
-    worker = new Worker("worker.js?v=1.10", { type: "module" });
+    worker = new Worker("worker.js?v=1.11", { type: "module" });
     attachWorkerHandlers(worker);
 
     statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
@@ -374,5 +401,5 @@ async function encodeWavBlobChunked(channels, sampleRate) {
 }
 
 dlBtn.addEventListener("click", async () => {
-  await triggerDownloadOrShare(true);
+  await triggerDownloadOrShare({ isAuto: false });
 });
