@@ -1,5 +1,9 @@
-const APP_VERSION = "Ver.1.5";
+const APP_VERSION = "Ver.1.6";
 const TARGET_SAMPLE_RATE = 44100;
+const MP3_BITRATE = 128;
+const MP3_BLOCK_SIZE = 1152;
+const LAMEJS_ESM_URL =
+  "https://cdn.jsdelivr.net/npm/@breezystack/lamejs@1.2.7/dist/lame.es.js";
 
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
@@ -8,13 +12,14 @@ const statusEl = document.getElementById("status");
 const dlBtn = document.getElementById("dl-accompaniment");
 
 let selectedFile = null;
-let currentAudioBlob = null;
+let currentMp3Blob = null;
 let currentBlobUrl = null;
-let currentFileName = "accompaniment.wav";
+let currentFileName = "accompaniment.mp3";
+let lameEncoderClassPromise = null;
 
-const worker = new Worker("worker.js?v=1.5", { type: "module" });
+const worker = new Worker("worker.js?v=1.6", { type: "module" });
 
-function isIosOrMobileSafari() {
+function isIosDevice() {
   const ua = navigator.userAgent || "";
   return /iPhone|iPad|iPod/i.test(ua);
 }
@@ -32,17 +37,21 @@ function isAllowedAudio(file) {
   return nameOk || typeOk;
 }
 
-function clearGeneratedAudio() {
+function clearGeneratedMp3() {
   if (currentBlobUrl) {
     try {
       URL.revokeObjectURL(currentBlobUrl);
     } catch (_) {}
     currentBlobUrl = null;
   }
-  currentAudioBlob = null;
+  currentMp3Blob = null;
   if (dlBtn) {
     dlBtn.disabled = true;
   }
+}
+
+function yieldTick(ms = 20) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 async function normalizeTo44100Stereo(decodedBuffer) {
@@ -86,7 +95,7 @@ async function normalizeTo44100Stereo(decodedBuffer) {
 
 fileInput.addEventListener("change", (e) => {
   const file = e.target.files?.[0];
-  clearGeneratedAudio();
+  clearGeneratedMp3();
 
   if (!isAllowedAudio(file)) {
     selectedFile = null;
@@ -98,7 +107,7 @@ fileInput.addEventListener("change", (e) => {
 
   selectedFile = file;
   const baseName = file.name.replace(/\.[^.]+$/, "") || "accompaniment";
-  currentFileName = `${baseName}_accompaniment.wav`;
+  currentFileName = `${baseName}_accompaniment.mp3`;
 
   runBtn.disabled = false;
   const mb = (file.size / 1024 / 1024).toFixed(2);
@@ -109,7 +118,7 @@ fileInput.addEventListener("change", (e) => {
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
-  clearGeneratedAudio();
+  clearGeneratedMp3();
   statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
@@ -153,66 +162,88 @@ runBtn.addEventListener("click", async () => {
   }
 });
 
-function encodeWavBlob(chL, chR, sampleRate) {
-  const numChannels = 2;
-  const length = Math.min(chL.length, chR.length);
-  const buffer = new ArrayBuffer(44 + length * numChannels * 2);
-  const view = new DataView(buffer);
+async function getMp3EncoderClass() {
+  if (!lameEncoderClassPromise) {
+    lameEncoderClassPromise = import(LAMEJS_ESM_URL)
+      .then((mod) => {
+        const Enc = mod?.Mp3Encoder || mod?.default?.Mp3Encoder;
+        if (!Enc) {
+          throw new Error("Mp3Encoder が見つかりませんでした。");
+        }
+        return Enc;
+      })
+      .catch((err) => {
+        lameEncoderClassPromise = null;
+        throw err;
+      });
+  }
+  return await lameEncoderClassPromise;
+}
 
-  const writeStr = (offset, str) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
+function floatToInt16Chunk(floatArr, start, end, outInt16) {
+  const len = end - start;
+  for (let i = 0; i < len; i++) {
+    const v = Math.max(-1, Math.min(1, floatArr[start + i]));
+    outInt16[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+  }
+  return outInt16.subarray(0, len);
+}
+
+async function encodeMp3Chunked(chL, chR, sampleRate, bitrate = MP3_BITRATE) {
+  const Mp3Encoder = await getMp3EncoderClass();
+  const encoder = new Mp3Encoder(2, sampleRate, bitrate);
+  const mp3Chunks = [];
+  const totalSamples = Math.min(chL.length, chR.length);
+
+  const pcmL = new Int16Array(MP3_BLOCK_SIZE);
+  const pcmR = new Int16Array(MP3_BLOCK_SIZE);
+
+  let stepCount = 0;
+  for (let i = 0; i < totalSamples; i += MP3_BLOCK_SIZE) {
+    const end = Math.min(totalSamples, i + MP3_BLOCK_SIZE);
+    const subL = floatToInt16Chunk(chL, i, end, pcmL);
+    const subR = floatToInt16Chunk(chR, i, end, pcmR);
+    const encoded = encoder.encodeBuffer(subL, subR);
+    if (encoded && encoded.length > 0) {
+      mp3Chunks.push(new Uint8Array(encoded));
     }
-  };
 
-  writeStr(0, "RIFF");
-  view.setUint32(4, 36 + length * numChannels * 2, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numChannels * 2, true);
-  view.setUint16(32, numChannels * 2, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, "data");
-  view.setUint32(40, length * numChannels * 2, true);
-
-  let offset = 44;
-  for (let i = 0; i < length; i++) {
-    const sL = Math.max(-1, Math.min(1, chL[i]));
-    const sR = Math.max(-1, Math.min(1, chR[i]));
-    view.setInt16(offset, sL < 0 ? sL * 0x8000 : sL * 0x7fff, true);
-    view.setInt16(offset + 2, sR < 0 ? sR * 0x8000 : sR * 0x7fff, true);
-    offset += 4;
+    stepCount++;
+    if (stepCount % 60 === 0) {
+      const pct = Math.min(99, Math.round((i / totalSamples) * 100));
+      statusEl.textContent = `ステップ3/3: MP3 (${bitrate}kbps) エンコード中... ${pct}%`;
+      await yieldTick(15);
+    }
   }
 
-  return new Blob([buffer], { type: "audio/wav" });
+  const flushed = encoder.flush();
+  if (flushed && flushed.length > 0) {
+    mp3Chunks.push(new Uint8Array(flushed));
+  }
+
+  return new Blob(mp3Chunks, { type: "audio/mpeg" });
 }
 
 dlBtn.addEventListener("click", async () => {
-  if (!currentAudioBlob || currentAudioBlob.size <= 44) {
-    statusEl.textContent = "保存できる音声データがありません。";
+  if (!currentMp3Blob || currentMp3Blob.size <= 0) {
+    statusEl.textContent = "保存できるMP3データがありません。";
     return;
   }
 
-  // iOS Safari では Web Share API（ファイル共有）が使える場合を優先して WebKitBlobResource エラーを回避
-  if (isIosOrMobileSafari() && typeof navigator.share === "function") {
+  if (isIosDevice() && typeof navigator.share === "function") {
     try {
-      const wavFile = new File([currentAudioBlob], currentFileName, {
-        type: "audio/wav",
+      const mp3File = new File([currentMp3Blob], currentFileName, {
+        type: "audio/mpeg",
       });
-      if (typeof navigator.canShare !== "function" || navigator.canShare({ files: [wavFile] })) {
+      if (typeof navigator.canShare !== "function" || navigator.canShare({ files: [mp3File] })) {
         await navigator.share({
-          files: [wavFile],
+          files: [mp3File],
           title: currentFileName,
         });
         statusEl.textContent = `共有メニューを開きました: ${currentFileName}`;
         return;
       }
     } catch (shareErr) {
-      // ユーザーが共有シートをキャンセルした場合はエラー扱いにしない
       if (shareErr?.name === "AbortError") {
         statusEl.textContent = "保存をキャンセルしました。";
         return;
@@ -222,7 +253,7 @@ dlBtn.addEventListener("click", async () => {
 
   try {
     if (!currentBlobUrl) {
-      currentBlobUrl = URL.createObjectURL(currentAudioBlob);
+      currentBlobUrl = URL.createObjectURL(currentMp3Blob);
     }
 
     const tempLink = document.createElement("a");
@@ -234,38 +265,39 @@ dlBtn.addEventListener("click", async () => {
     tempLink.click();
     document.body.removeChild(tempLink);
 
-    statusEl.textContent = `保存処理を実行しました: ${currentFileName}`;
+    statusEl.textContent = `MP3ダウンロードを開始しました: ${currentFileName}`;
   } catch (err) {
     statusEl.textContent = `ダウンロードエラー: ${err.message}`;
   }
 });
 
-worker.onmessage = (e) => {
+worker.onmessage = async (e) => {
   const { type, message, accompaniment, sampleRate } = e.data;
 
   if (type === "progress") {
     statusEl.textContent = message;
   } else if (type === "done") {
-    statusEl.textContent = "ステップ3/3: 音声ファイルを生成中...";
+    statusEl.textContent = `ステップ3/3: MP3 (${MP3_BITRATE}kbps) を生成中...`;
 
     try {
+      await yieldTick(40);
+
       if (accompaniment) {
-        currentAudioBlob = encodeWavBlob(
-          accompaniment.left,
-          accompaniment.right,
-          sampleRate
-        );
+        const chL = accompaniment.left;
+        const chR = accompaniment.right;
         accompaniment.left = null;
         accompaniment.right = null;
+
+        currentMp3Blob = await encodeMp3Chunked(chL, chR, sampleRate, MP3_BITRATE);
 
         if (dlBtn) {
           dlBtn.disabled = false;
         }
       }
 
-      statusEl.textContent = "完了! 「音声 保存」を押して保存してください。";
+      statusEl.textContent = "完了! 「MP3 保存」を押してダウンロードしてください。";
     } catch (err) {
-      statusEl.textContent = `音声生成エラー: ${err.message}`;
+      statusEl.textContent = `MP3変換エラー: ${err.message}`;
     } finally {
       runBtn.disabled = false;
     }
