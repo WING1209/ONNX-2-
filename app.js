@@ -1,5 +1,9 @@
-const APP_VERSION = "Ver.1.1";
+import * as lamejs from "https://cdn.jsdelivr.net/npm/@breezystack/lamejs@1.2.7/dist/lame.es.js";
+
+const APP_VERSION = "Ver.1.2";
 const TARGET_SAMPLE_RATE = 44100;
+const MP3_BITRATE = 128;
+const MP3_BLOCK_SIZE = 1152;
 
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
@@ -8,11 +12,11 @@ const statusEl = document.getElementById("status");
 const dlBtn = document.getElementById("dl-accompaniment");
 
 let selectedFile = null;
-let currentWavBlob = null;
+let currentMp3Blob = null;
 let currentBlobUrl = null;
-let currentFileName = "accompaniment.wav";
+let currentFileName = "accompaniment.mp3";
 
-const worker = new Worker("worker.js?v=1.1", { type: "module" });
+const worker = new Worker("worker.js?v=1.2", { type: "module" });
 
 function isAllowedAudio(file) {
   if (!file) return false;
@@ -27,12 +31,12 @@ function isAllowedAudio(file) {
   return nameOk || typeOk;
 }
 
-function clearGeneratedWav() {
+function clearGeneratedMp3() {
   if (currentBlobUrl) {
     URL.revokeObjectURL(currentBlobUrl);
     currentBlobUrl = null;
   }
-  currentWavBlob = null;
+  currentMp3Blob = null;
   if (dlBtn) {
     dlBtn.disabled = true;
   }
@@ -79,7 +83,7 @@ async function normalizeTo44100Stereo(decodedBuffer) {
 
 fileInput.addEventListener("change", (e) => {
   const file = e.target.files?.[0];
-  clearGeneratedWav();
+  clearGeneratedMp3();
 
   if (!isAllowedAudio(file)) {
     selectedFile = null;
@@ -91,7 +95,7 @@ fileInput.addEventListener("change", (e) => {
 
   selectedFile = file;
   const baseName = file.name.replace(/\.[^.]+$/, "") || "accompaniment";
-  currentFileName = `${baseName}_accompaniment.wav`;
+  currentFileName = `${baseName}_accompaniment.mp3`;
 
   runBtn.disabled = false;
   const mb = (file.size / 1024 / 1024).toFixed(2);
@@ -102,7 +106,7 @@ fileInput.addEventListener("change", (e) => {
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
-  clearGeneratedWav();
+  clearGeneratedMp3();
   statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
@@ -146,50 +150,52 @@ runBtn.addEventListener("click", async () => {
   }
 });
 
-function encodeWav(chL, chR, sampleRate) {
-  const numChannels = 2;
-  const length = chL.length;
-  const buffer = new ArrayBuffer(44 + length * numChannels * 2);
-  const view = new DataView(buffer);
+function floatToInt16Chunk(floatArr, start, end, outInt16) {
+  const len = end - start;
+  for (let i = 0; i < len; i++) {
+    const v = Math.max(-1, Math.min(1, floatArr[start + i]));
+    outInt16[i] = v < 0 ? v * 0x8000 : v * 0x7fff;
+  }
+  return outInt16.subarray(0, len);
+}
 
-  const writeStr = (offset, str) => {
-    for (let i = 0; i < str.length; i++) {
-      view.setUint8(offset + i, str.charCodeAt(i));
-    }
-  };
-
-  writeStr(0, "RIFF");
-  view.setUint32(4, 36 + length * numChannels * 2, true);
-  writeStr(8, "WAVE");
-  writeStr(12, "fmt ");
-  view.setUint32(16, 16, true);
-  view.setUint16(20, 1, true); // PCM
-  view.setUint16(22, numChannels, true);
-  view.setUint32(24, sampleRate, true);
-  view.setUint32(28, sampleRate * numChannels * 2, true);
-  view.setUint16(32, numChannels * 2, true);
-  view.setUint16(34, 16, true);
-  writeStr(36, "data");
-  view.setUint32(40, length * numChannels * 2, true);
-
-  let offset = 44;
-  for (let i = 0; i < length; i++) {
-    const sL = Math.max(-1, Math.min(1, chL[i]));
-    const sR = Math.max(-1, Math.min(1, chR[i]));
-    view.setInt16(offset, sL < 0 ? sL * 0x8000 : sL * 0x7fff, true);
-    view.setInt16(offset + 2, sR < 0 ? sR * 0x8000 : sR * 0x7fff, true);
-    offset += 4;
+function encodeMp3(chL, chR, sampleRate, bitrate = MP3_BITRATE) {
+  const Mp3Encoder = lamejs?.Mp3Encoder;
+  if (!Mp3Encoder) {
+    throw new Error("MP3エンコーダ（lamejs）の読み込みに失敗しました。");
   }
 
-  return new Blob([buffer], { type: "audio/wav" });
+  const encoder = new Mp3Encoder(2, sampleRate, bitrate);
+  const mp3Chunks = [];
+  const totalSamples = Math.min(chL.length, chR.length);
+
+  const pcmL = new Int16Array(MP3_BLOCK_SIZE);
+  const pcmR = new Int16Array(MP3_BLOCK_SIZE);
+
+  for (let i = 0; i < totalSamples; i += MP3_BLOCK_SIZE) {
+    const end = Math.min(totalSamples, i + MP3_BLOCK_SIZE);
+    const subL = floatToInt16Chunk(chL, i, end, pcmL);
+    const subR = floatToInt16Chunk(chR, i, end, pcmR);
+    const encoded = encoder.encodeBuffer(subL, subR);
+    if (encoded && encoded.length > 0) {
+      mp3Chunks.push(new Uint8Array(encoded));
+    }
+  }
+
+  const flushed = encoder.flush();
+  if (flushed && flushed.length > 0) {
+    mp3Chunks.push(new Uint8Array(flushed));
+  }
+
+  return new Blob(mp3Chunks, { type: "audio/mpeg" });
 }
 
 dlBtn.addEventListener("click", () => {
-  if (!currentWavBlob) return;
+  if (!currentMp3Blob) return;
 
   try {
     if (!currentBlobUrl) {
-      currentBlobUrl = URL.createObjectURL(currentWavBlob);
+      currentBlobUrl = URL.createObjectURL(currentMp3Blob);
     }
 
     const tempLink = document.createElement("a");
@@ -200,9 +206,8 @@ dlBtn.addEventListener("click", () => {
     tempLink.click();
     document.body.removeChild(tempLink);
 
-    statusEl.textContent = `ダウンロードを開始しました: ${currentFileName}`;
+    statusEl.textContent = `MP3ダウンロードを開始しました: ${currentFileName}`;
 
-    // 保存開始後に少し待ってから Blob URL を解放し、メモリ保持を軽減
     setTimeout(() => {
       if (currentBlobUrl) {
         URL.revokeObjectURL(currentBlobUrl);
@@ -220,19 +225,29 @@ worker.onmessage = (e) => {
   if (type === "progress") {
     statusEl.textContent = message;
   } else if (type === "done") {
-    statusEl.textContent = "ステップ3/3: 伴奏WAVファイルを生成中...";
+    statusEl.textContent = `ステップ3/3: MP3 (${MP3_BITRATE}kbps) を生成中...`;
 
-    if (accompaniment) {
-      currentWavBlob = encodeWav(accompaniment.left, accompaniment.right, sampleRate);
-      accompaniment.left = null;
-      accompaniment.right = null;
-      if (dlBtn) {
-        dlBtn.disabled = false;
+    try {
+      if (accompaniment) {
+        currentMp3Blob = encodeMp3(
+          accompaniment.left,
+          accompaniment.right,
+          sampleRate,
+          MP3_BITRATE
+        );
+        accompaniment.left = null;
+        accompaniment.right = null;
+        if (dlBtn) {
+          dlBtn.disabled = false;
+        }
       }
-    }
 
-    statusEl.textContent = "完了! 「WAV 保存」を押してダウンロードしてください。";
-    runBtn.disabled = false;
+      statusEl.textContent = "完了! 「MP3 保存」を押してダウンロードしてください。";
+    } catch (err) {
+      statusEl.textContent = `MP3変換エラー: ${err.message}`;
+    } finally {
+      runBtn.disabled = false;
+    }
   } else if (type === "error") {
     statusEl.textContent = `分離エラー: ${message || "処理中にエラーが発生しました。"}`;
     runBtn.disabled = false;
