@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>【WING】-stem separation- Ver.1.10</title>
+<title>【WING】-stem separation- Ver.1.11</title>
 <style>
 * { box-sizing: border-box; }
 body {
@@ -34,7 +34,7 @@ body {
   line-height: 1.25;
   font-weight: 900;
   letter-spacing: 0.02em;
-  margin: 0 0 18px;
+  margin: 0 0 12px;
   padding: 16px 12px;
   border-radius: 20px;
   border: 3.5px solid #1e1b4b;
@@ -77,6 +77,45 @@ body {
   font-weight: 900;
   letter-spacing: 0.06em;
   border: 2px solid #ffffff;
+}
+.auto-save-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 14px;
+  padding: 10px 14px;
+  border-radius: 16px;
+  background: #f3e8ff;
+  border: 2.5px solid #1e1b4b;
+  box-shadow: 3px 3px 0px #1e1b4b;
+}
+.auto-save-label {
+  font-size: 0.9rem;
+  font-weight: 900;
+  color: #1e1b4b;
+}
+.auto-save-btn {
+  padding: 7px 14px;
+  border-radius: 999px;
+  border: 2px solid #1e1b4b;
+  box-shadow: 2px 2px 0px #1e1b4b;
+  font-size: 0.85rem;
+  font-weight: 900;
+  cursor: pointer;
+  transition: transform 0.1s ease, background 0.15s ease;
+}
+.auto-save-btn.is-on {
+  background: #4ade80;
+  color: #1e1b4b;
+}
+.auto-save-btn.is-off {
+  background: #e2e8f0;
+  color: #475569;
+}
+.auto-save-btn:active {
+  transform: translate(2px, 2px);
+  box-shadow: 0px 0px 0px #1e1b4b;
 }
 .file-label {
   display: flex;
@@ -213,8 +252,12 @@ input[type="file"] {
   <header class="app-title">
     <span class="title-rainbow">【WING】</span><br>
     <span class="title-accent">-stem separation-</span><br>
-    <span class="title-version">Ver.1.10</span>
+    <span class="title-version">Ver.1.11</span>
   </header>
+  <div class="auto-save-bar">
+    <span class="auto-save-label">💾 完了後の自動保存</span>
+    <button id="autoSaveToggle" type="button" class="auto-save-btn is-on" aria-pressed="true">ON</button>
+  </div>
   <label for="audioFile" class="file-label" id="fileLabel">
     <span>♫♪ 音源ファイルを選択 (タップ) ✨</span>
     <span class="file-sub" id="fileSub">対応形式: MP3 / WAV (44100Hz・ステレオ)</span>
@@ -229,6 +272,6 @@ input[type="file"] {
     </div>
   </div>
 </div>
-<script type="module" src="app.js?v=1.10"></script>
+<script type="module" src="app.js?v=1.11"></script>
 </body>
 </html>
