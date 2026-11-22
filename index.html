@@ -228,6 +228,78 @@ input[type="file"] {
   box-shadow: 3px 3px 0px #cbd5e1;
   cursor: not-allowed;
 }
+.merge-panel {
+  margin-top: 16px;
+  padding: 14px;
+  border-radius: 18px;
+  background: #fef3c7;
+  border: 2.5px solid #1e1b4b;
+  box-shadow: 4px 4px 0px #1e1b4b;
+}
+.merge-title {
+  font-size: 0.92rem;
+  font-weight: 900;
+  margin-bottom: 8px;
+  color: #1e1b4b;
+}
+.merge-pick-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  width: 100%;
+  padding: 12px 10px;
+  border: 2.5px dashed #d97706;
+  border-radius: 14px;
+  background: #ffffff;
+  font-size: 0.9rem;
+  font-weight: 800;
+  color: #1e1b4b;
+  cursor: pointer;
+  text-align: center;
+}
+.merge-pick-sub {
+  font-size: 0.74rem;
+  font-weight: 700;
+  color: #92400e;
+}
+.merge-list {
+  margin-top: 10px;
+  padding-left: 18px;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: #1e1b4b;
+  word-break: break-all;
+}
+.merge-list li {
+  margin-bottom: 4px;
+}
+.merge-btn {
+  display: block;
+  width: 100%;
+  padding: 13px;
+  margin-top: 10px;
+  font-size: 0.98rem;
+  font-weight: 900;
+  border: 2.5px solid #1e1b4b;
+  border-radius: 15px;
+  background: linear-gradient(90deg, #fbbf24 0%, #fb7185 100%);
+  color: #1e1b4b;
+  box-shadow: 4px 4px 0px #1e1b4b;
+  cursor: pointer;
+}
+.merge-btn:active:not(:disabled) {
+  transform: translate(3px, 3px);
+  box-shadow: 1px 1px 0px #1e1b4b;
+}
+.merge-btn:disabled {
+  background: #e2e8f0;
+  color: #64748b;
+  border-color: #94a3b8;
+  box-shadow: none;
+  cursor: not-allowed;
+}
 .status {
   margin-top: 14px;
   padding: 11px 14px;
@@ -320,6 +392,18 @@ input[type="file"] {
   </label>
   <input type="file" id="audioFile" accept=".mp3, .wav, audio/mpeg, audio/wav">
   <button id="runBtn" class="btn" disabled>🎸 伴奏抽出を実行！</button>
+
+  <section class="merge-panel">
+    <div class="merge-title">🧩 細切れファイルをロードして1つに統合</div>
+    <label for="mergeFilesInput" class="merge-pick-label">
+      <span>📂 統合する細切れWAV/MP3を複数選択</span>
+      <span class="merge-pick-sub" id="mergePickSub">0-45s / 45-90s などのファイルをまとめて選択（秒数順に自動整列）</span>
+    </label>
+    <input type="file" id="mergeFilesInput" accept=".wav, .mp3, audio/wav, audio/mpeg" multiple>
+    <ol id="mergeFileList" class="merge-list"></ol>
+    <button id="mergeBtn" type="button" class="merge-btn" disabled>🔗 選択したファイルを1つに統合！</button>
+  </section>
+
   <div id="status" class="status">MP3 または WAVファイルを選択してください。</div>
   <div id="results">
     <div class="stem">
@@ -328,6 +412,6 @@ input[type="file"] {
     </div>
   </div>
 </div>
-<script type="module" src="app.js?v=1.14-fp16-auto"></script>
+<script type="module" src="app.js?v=1.14-fp16-merge"></script>
 </body>
 </html>
