@@ -1,8 +1,9 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
 
-// iOS Safari でのクラッシュ・メモリ膨張を防ぐ設定
+// iOS Safari でのクラッシュ・WASMメモリ膨張を防ぐ設定
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
+ort.env.wasm.simd = false;
 
 const ACCOMPANIMENT_MODEL_URL =
   "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/accompaniment.onnx?download=true";
@@ -15,9 +16,12 @@ const HOP_LENGTH = 1024;
 const FREQ_BINS = N_FFT / 2 + 1; // 2049
 const MODEL_BINS = 1024;
 
-// iPhone向け省メモリチャンク設定（3秒チャンク + 0.3秒オーバーラップ）
-const CHUNK_SAMPLES = 44100 * 3;
-const OVERLAP_SAMPLES = Math.floor(44100 * 0.3);
+// U-Net のダウンサンプリング倍数（16の倍数）に合わせた極小フレーム数（64フレーム ≒ 約1.48秒）
+const MIN_DYNAMIC_FRAMES = 64;
+const OVERLAP_FRAMES = 8; // 約0.18秒のオーバーラップで継ぎ目を滑らかに接続
+
+// iOS Safari で WASM ヒープが膨らみ続けるのを防ぐため、12チャンクごとにセッションを再初期化
+const SESSION_RECYCLE_INTERVAL = 12;
 
 function createPeriodicHannWindow(length) {
   const win = new Float32Array(length);
@@ -29,7 +33,7 @@ function createPeriodicHannWindow(length) {
 
 const HANN_WINDOW = createPeriodicHannWindow(N_FFT);
 
-async function loadAccompanimentModelBuffer() {
+async function loadAccompanimentModelBytes() {
   const cacheSupported = typeof caches !== "undefined";
 
   if (cacheSupported) {
@@ -40,7 +44,8 @@ async function loadAccompanimentModelBuffer() {
         type: "progress",
         message: "キャッシュから伴奏モデルを読込中...",
       });
-      return await cachedResponse.arrayBuffer();
+      const buf = await cachedResponse.arrayBuffer();
+      return new Uint8Array(buf);
     }
 
     postMessage({
@@ -54,7 +59,8 @@ async function loadAccompanimentModelBuffer() {
     }
 
     await cache.put(ACCOMPANIMENT_MODEL_URL, response.clone());
-    return await response.arrayBuffer();
+    const buf = await response.arrayBuffer();
+    return new Uint8Array(buf);
   }
 
   postMessage({
@@ -66,24 +72,16 @@ async function loadAccompanimentModelBuffer() {
   if (!response.ok) {
     throw new Error(`伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
   }
-  return await response.arrayBuffer();
+  const buf = await response.arrayBuffer();
+  return new Uint8Array(buf);
 }
 
-async function createAccompanimentSession() {
-  let modelBuffer = await loadAccompanimentModelBuffer();
-
-  postMessage({
-    type: "progress",
-    message: "AIセッションを展開中 (省メモリモード)...",
-  });
-
-  const modelBytes = new Uint8Array(modelBuffer);
-  modelBuffer = null;
-
+async function createSessionFromBytes(modelBytes) {
   return await ort.InferenceSession.create(modelBytes, {
     executionProviders: ["wasm"],
     enableMemPattern: false,
     enableCpuMemArena: false,
+    graphOptimizationLevel: "basic",
   });
 }
 
@@ -223,55 +221,52 @@ function computeIstft(reSpec, imSpec, numFrames, outputLength) {
   return out;
 }
 
-function buildSpleeterInputTensor(session, leftStft, rightStft) {
+/**
+ * モデルの入力メタデータを確認し、動的軸なら極小フレーム（64フレーム）、
+ * 固定軸ならそのフレーム数を返す
+ */
+function resolveChunkFrames(session) {
   const inputName = session.inputNames[0];
   const meta = session.inputMetadata?.[inputName];
-  const dims = meta?.dimensions || [2, 1, 512, MODEL_BINS];
+  const dims = meta?.dimensions || [];
 
   const chDim = typeof dims[0] === "number" && dims[0] > 0 ? dims[0] : 2;
-  const axis2 = typeof dims[2] === "number" && dims[2] > 0 ? dims[2] : 512;
+  const isTimeFixed = typeof dims[2] === "number" && dims[2] > 0;
+  const targetFrames = isTimeFixed ? dims[2] : MIN_DYNAMIC_FRAMES;
   const freqBins = typeof dims[3] === "number" && dims[3] > 0 ? dims[3] : MODEL_BINS;
 
-  const totalFrames = leftStft.numFrames;
-  const numSplits =
-    typeof dims[1] === "number" && dims[1] > 0
-      ? dims[1]
-      : Math.max(1, Math.ceil(totalFrames / axis2));
+  return { chDim, targetFrames, freqBins, isTimeFixed };
+}
 
-  const data = new Float32Array(chDim * numSplits * axis2 * freqBins);
+function buildMiniTensor(spec, leftStft, rightStft) {
+  const { chDim, targetFrames, freqBins } = spec;
+  const numSplits = 1;
+  const totalFrames = leftStft.numFrames;
+
+  const data = new Float32Array(chDim * numSplits * targetFrames * freqBins);
 
   for (let c = 0; c < chDim; c++) {
     const srcRe = c === 0 ? leftStft.re : rightStft.re;
     const srcIm = c === 0 ? leftStft.im : rightStft.im;
 
-    for (let sp = 0; sp < numSplits; sp++) {
-      for (let t = 0; t < axis2; t++) {
-        const frameIdx = sp * axis2 + t;
-        const dstOffset = ((c * numSplits + sp) * axis2 + t) * freqBins;
-
-        if (frameIdx < totalFrames) {
-          const srcOffset = frameIdx * FREQ_BINS;
-          const copyBins = Math.min(freqBins, FREQ_BINS);
-          for (let b = 0; b < copyBins; b++) {
-            const r = srcRe[srcOffset + b];
-            const im = srcIm[srcOffset + b];
-            data[dstOffset + b] = Math.hypot(r, im);
-          }
-        }
+    const copyFrames = Math.min(targetFrames, totalFrames);
+    for (let t = 0; t < copyFrames; t++) {
+      const dstOffset = (c * targetFrames + t) * freqBins;
+      const srcOffset = t * FREQ_BINS;
+      const copyBins = Math.min(freqBins, FREQ_BINS);
+      for (let b = 0; b < copyBins; b++) {
+        const r = srcRe[srcOffset + b];
+        const im = srcIm[srcOffset + b];
+        data[dstOffset + b] = Math.hypot(r, im);
       }
     }
   }
 
-  return {
-    tensor: new ort.Tensor("float32", data, [chDim, numSplits, axis2, freqBins]),
-    numSplits,
-    axis2,
-    freqBins,
-  };
+  return new ort.Tensor("float32", data, [chDim, numSplits, targetFrames, freqBins]);
 }
 
-function reconChannelWithTensor(stftObj, chIdx, outTensor, metaInfo, outputLength) {
-  const { numSplits, axis2, freqBins } = metaInfo;
+function reconChannelMini(stftObj, chIdx, outTensor, spec, outputLength) {
+  const { targetFrames, freqBins } = spec;
   const dims = outTensor.dims || [];
   const chCountInOut = dims.length >= 1 && dims[0] >= 2 ? 2 : 1;
   const outData = outTensor.data;
@@ -281,8 +276,6 @@ function reconChannelWithTensor(stftObj, chIdx, outTensor, metaInfo, outputLengt
   const mIm = new Float32Array(stftObj.im.length);
 
   for (let f = 0; f < totalFrames; f++) {
-    const sp = Math.floor(f / axis2);
-    const t = f % axis2;
     const base = f * FREQ_BINS;
 
     for (let b = 0; b < FREQ_BINS; b++) {
@@ -291,9 +284,9 @@ function reconChannelWithTensor(stftObj, chIdx, outTensor, metaInfo, outputLengt
       const origMag = Math.hypot(r, im);
 
       let gain = 1.0;
-      if (sp < numSplits && b < freqBins) {
+      if (f < targetFrames && b < freqBins) {
         const actualCh = chCountInOut >= 2 ? chIdx : 0;
-        const outIdx = ((actualCh * numSplits + sp) * axis2 + t) * freqBins + b;
+        const outIdx = (actualCh * targetFrames + f) * freqBins + b;
         const predVal = outData[outIdx];
         if (typeof predVal === "number" && Number.isFinite(predVal)) {
           gain = origMag > 1e-6 ? Math.max(0, Math.min(2.0, predVal / origMag)) : 0;
@@ -315,8 +308,13 @@ function clampBuffer(buf) {
   }
 }
 
+function yieldForGC(ms = 60) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 self.onmessage = async (e) => {
   let session = null;
+  let modelBytes = null;
 
   try {
     const { sampleRate, left, right } = e.data;
@@ -325,10 +323,25 @@ self.onmessage = async (e) => {
     const dstLeft = new Float32Array(totalLength);
     const dstRight = new Float32Array(totalLength);
 
-    const step = Math.max(1, CHUNK_SAMPLES - OVERLAP_SAMPLES);
+    modelBytes = await loadAccompanimentModelBytes();
+
+    postMessage({
+      type: "progress",
+      message: "AIセッションを初期化中...",
+    });
+
+    session = await createSessionFromBytes(modelBytes);
+    const spec = resolveChunkFrames(session);
+
+    // 極小チャンクのサンプル数とオーバーラップを決定
+    const chunkSamples = Math.max(N_FFT + HOP_LENGTH, spec.targetFrames * HOP_LENGTH);
+    const overlapSamples = Math.min(
+      Math.floor(chunkSamples * 0.2),
+      OVERLAP_FRAMES * HOP_LENGTH
+    );
+    const step = Math.max(HOP_LENGTH, chunkSamples - overlapSamples);
     const totalChunks = Math.max(1, Math.ceil(totalLength / step));
 
-    session = await createAccompanimentSession();
     const inputName = session.inputNames[0];
     const outputName = session.outputNames[0];
 
@@ -336,7 +349,19 @@ self.onmessage = async (e) => {
       const start = chunkIdx * step;
       if (start >= totalLength) break;
 
-      const end = Math.min(totalLength, start + CHUNK_SAMPLES);
+      // 一定チャンクごとにセッションを再生成して iOS の WASM ヒープ膨張を防ぐ
+      if (chunkIdx > 0 && chunkIdx % SESSION_RECYCLE_INTERVAL === 0) {
+        postMessage({
+          type: "progress",
+          message: `メモリをリフレッシュ中... (${Math.round((chunkIdx / totalChunks) * 100)}%)`,
+        });
+        await releaseSession(session);
+        session = null;
+        await yieldForGC(120);
+        session = await createSessionFromBytes(modelBytes);
+      }
+
+      const end = Math.min(totalLength, start + chunkSamples);
       const pct = Math.round(((chunkIdx + 1) / totalChunks) * 100);
 
       postMessage({
@@ -350,20 +375,22 @@ self.onmessage = async (e) => {
       let leftStft = computeStft(leftSlice);
       let rightStft = computeStft(rightSlice);
 
-      const built = buildSpleeterInputTensor(session, leftStft, rightStft);
-      const results = await session.run({ [inputName]: built.tensor });
+      let inputTensor = buildMiniTensor(spec, leftStft, rightStft);
+      let results = await session.run({ [inputName]: inputTensor });
       const outTensor = results[outputName];
 
       if (!outTensor) {
-        built.tensor.dispose();
+        inputTensor.dispose();
         throw new Error(`出力 "${outputName}" が取得できませんでした。`);
       }
 
-      const outL = reconChannelWithTensor(leftStft, 0, outTensor, built, leftSlice.length);
-      const outR = reconChannelWithTensor(rightStft, 1, outTensor, built, rightSlice.length);
+      const outL = reconChannelMini(leftStft, 0, outTensor, spec, leftSlice.length);
+      const outR = reconChannelMini(rightStft, 1, outTensor, spec, rightSlice.length);
 
-      built.tensor.dispose();
+      inputTensor.dispose();
       outTensor.dispose();
+      inputTensor = null;
+      results = null;
       leftStft = null;
       rightStft = null;
 
@@ -371,9 +398,9 @@ self.onmessage = async (e) => {
         const outIdx = start + i;
         if (outIdx >= totalLength) break;
 
-        const overlapStart = outL.length - OVERLAP_SAMPLES;
-        if (chunkIdx < totalChunks - 1 && OVERLAP_SAMPLES > 0 && i >= overlapStart) {
-          const t = (i - overlapStart) / OVERLAP_SAMPLES;
+        const overlapStart = outL.length - overlapSamples;
+        if (chunkIdx < totalChunks - 1 && overlapSamples > 0 && i >= overlapStart) {
+          const t = (i - overlapStart) / overlapSamples;
           const fadeOut = 1 - t;
           dstLeft[outIdx] = dstLeft[outIdx] * fadeOut + outL[i] * t;
           dstRight[outIdx] = dstRight[outIdx] * fadeOut + outR[i] * t;
@@ -382,10 +409,16 @@ self.onmessage = async (e) => {
           dstRight[outIdx] = outR[i];
         }
       }
+
+      // ブラウザに GC のタイミングを与える
+      if (chunkIdx % 2 === 1) {
+        await yieldForGC(20);
+      }
     }
 
     await releaseSession(session);
     session = null;
+    modelBytes = null;
 
     clampBuffer(dstLeft);
     clampBuffer(dstRight);
@@ -408,6 +441,7 @@ self.onmessage = async (e) => {
     );
   } catch (err) {
     await releaseSession(session);
+    modelBytes = null;
     postMessage({
       type: "error",
       message: err?.message || String(err),
