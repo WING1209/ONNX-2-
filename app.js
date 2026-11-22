@@ -1,13 +1,18 @@
+const APP_VERSION = "Ver.1.1";
 const TARGET_SAMPLE_RATE = 44100;
 
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
 const runBtn = document.getElementById("runBtn");
 const statusEl = document.getElementById("status");
-const dlLink = document.getElementById("dl-accompaniment");
+const dlBtn = document.getElementById("dl-accompaniment");
 
 let selectedFile = null;
-const worker = new Worker("worker.js?v=4", { type: "module" });
+let currentWavBlob = null;
+let currentBlobUrl = null;
+let currentFileName = "accompaniment.wav";
+
+const worker = new Worker("worker.js?v=1.1", { type: "module" });
 
 function isAllowedAudio(file) {
   if (!file) return false;
@@ -22,13 +27,15 @@ function isAllowedAudio(file) {
   return nameOk || typeOk;
 }
 
-function resetDownloadLink() {
-  if (!dlLink) return;
-  if (dlLink.href && dlLink.href.startsWith("blob:")) {
-    URL.revokeObjectURL(dlLink.href);
+function clearGeneratedWav() {
+  if (currentBlobUrl) {
+    URL.revokeObjectURL(currentBlobUrl);
+    currentBlobUrl = null;
   }
-  dlLink.classList.add("disabled");
-  dlLink.removeAttribute("href");
+  currentWavBlob = null;
+  if (dlBtn) {
+    dlBtn.disabled = true;
+  }
 }
 
 async function normalizeTo44100Stereo(decodedBuffer) {
@@ -72,7 +79,7 @@ async function normalizeTo44100Stereo(decodedBuffer) {
 
 fileInput.addEventListener("change", (e) => {
   const file = e.target.files?.[0];
-  resetDownloadLink();
+  clearGeneratedWav();
 
   if (!isAllowedAudio(file)) {
     selectedFile = null;
@@ -83,16 +90,19 @@ fileInput.addEventListener("change", (e) => {
   }
 
   selectedFile = file;
+  const baseName = file.name.replace(/\.[^.]+$/, "") || "accompaniment";
+  currentFileName = `${baseName}_accompaniment.wav`;
+
   runBtn.disabled = false;
   const mb = (file.size / 1024 / 1024).toFixed(2);
   fileSub.textContent = `${file.name} (${mb} MB)`;
-  statusEl.textContent = `選択完了: ${file.name} - 「伴奏抽出を実行！」を押してください。`;
+  statusEl.textContent = `選択完了: ${file.name} (${APP_VERSION}) - 「伴奏抽出を実行！」を押してください。`;
 });
 
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
-  resetDownloadLink();
+  clearGeneratedWav();
   statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
@@ -174,6 +184,36 @@ function encodeWav(chL, chR, sampleRate) {
   return new Blob([buffer], { type: "audio/wav" });
 }
 
+dlBtn.addEventListener("click", () => {
+  if (!currentWavBlob) return;
+
+  try {
+    if (!currentBlobUrl) {
+      currentBlobUrl = URL.createObjectURL(currentWavBlob);
+    }
+
+    const tempLink = document.createElement("a");
+    tempLink.href = currentBlobUrl;
+    tempLink.download = currentFileName;
+    tempLink.style.display = "none";
+    document.body.appendChild(tempLink);
+    tempLink.click();
+    document.body.removeChild(tempLink);
+
+    statusEl.textContent = `ダウンロードを開始しました: ${currentFileName}`;
+
+    // 保存開始後に少し待ってから Blob URL を解放し、メモリ保持を軽減
+    setTimeout(() => {
+      if (currentBlobUrl) {
+        URL.revokeObjectURL(currentBlobUrl);
+        currentBlobUrl = null;
+      }
+    }, 3000);
+  } catch (err) {
+    statusEl.textContent = `ダウンロードエラー: ${err.message}`;
+  }
+});
+
 worker.onmessage = (e) => {
   const { type, message, accompaniment, sampleRate } = e.data;
 
@@ -182,15 +222,16 @@ worker.onmessage = (e) => {
   } else if (type === "done") {
     statusEl.textContent = "ステップ3/3: 伴奏WAVファイルを生成中...";
 
-    if (dlLink && accompaniment) {
-      const blob = encodeWav(accompaniment.left, accompaniment.right, sampleRate);
-      dlLink.href = URL.createObjectURL(blob);
-      dlLink.classList.remove("disabled");
+    if (accompaniment) {
+      currentWavBlob = encodeWav(accompaniment.left, accompaniment.right, sampleRate);
       accompaniment.left = null;
       accompaniment.right = null;
+      if (dlBtn) {
+        dlBtn.disabled = false;
+      }
     }
 
-    statusEl.textContent = "完了! 伴奏WAVを保存できます。";
+    statusEl.textContent = "完了! 「WAV 保存」を押してダウンロードしてください。";
     runBtn.disabled = false;
   } else if (type === "error") {
     statusEl.textContent = `分離エラー: ${message || "処理中にエラーが発生しました。"}`;
