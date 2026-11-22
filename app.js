@@ -1,7 +1,7 @@
 const APP_VERSION = "Ver.1.13";
 const TARGET_SAMPLE_RATE = 44100;
 
-// 大容量ファイルでのメモリピークを抑える出力設定
+// iOSのメモリピークを抑える軽量出力設定
 const OUTPUT_SAMPLE_RATE = 22050;
 const OUTPUT_CHANNELS = 1;
 
@@ -116,7 +116,7 @@ function releaseBackgroundMemoryOnDownload(urlToKeepBriefly = null) {
   }
 }
 
-function yieldTick(ms = 30) {
+function yieldTick(ms = 25) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -276,7 +276,7 @@ function attachWorkerHandlers(w) {
       statusEl.textContent = "ステップ3/3: 音声ファイルを生成中...";
 
       try {
-        await yieldTick(35);
+        await yieldTick(30);
 
         if (accompaniment) {
           let chL = accompaniment.left;
@@ -293,8 +293,6 @@ function attachWorkerHandlers(w) {
           );
           chL = null;
           chR = null;
-
-          await yieldTick(25);
 
           currentAudioBlob = await encodeWavBlobChunked(
             builtOut.channels,
@@ -361,7 +359,7 @@ runBtn.addEventListener("click", async () => {
   statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
-    let arrayBuffer = await selectedFile.arrayBuffer();
+    const arrayBuffer = await selectedFile.arrayBuffer();
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioCtx = new AudioContextClass();
     let audioBuffer;
@@ -369,7 +367,6 @@ runBtn.addEventListener("click", async () => {
     try {
       audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
     } finally {
-      arrayBuffer = null;
       if (typeof audioCtx.close === "function") {
         await audioCtx.close().catch(() => {});
       }
@@ -383,23 +380,17 @@ runBtn.addEventListener("click", async () => {
       statusEl.textContent = `ステップ1/3: 44100Hz・ステレオに変換中... (元: ${audioBuffer.sampleRate}Hz / ${audioBuffer.numberOfChannels}ch)`;
     }
 
-    let normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
-    audioBuffer = null;
-
-    await yieldTick(25);
-
+    const normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
-    const outRate = normalizedBuffer.sampleRate;
-    normalizedBuffer = null;
 
-    worker = new Worker("worker.js?v=1.13", { type: "module" });
+    worker = new Worker("worker.js?v=1.13-fp16", { type: "module" });
     attachWorkerHandlers(worker);
 
-    statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
+    statusEl.textContent = "ステップ2/3: FP16モデル確認・伴奏抽出を開始中...";
     worker.postMessage(
       {
-        sampleRate: outRate,
+        sampleRate: normalizedBuffer.sampleRate,
         left,
         right,
       },
@@ -457,7 +448,7 @@ async function encodeWavBlobChunked(channels, sampleRate) {
     }
 
     parts.push(segBuf);
-    await yieldTick(18);
+    await yieldTick(15);
   }
 
   return new Blob(parts, { type: "audio/wav" });
