@@ -1,15 +1,3 @@
-const isMobile =
-  /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) &&
-  window.innerWidth <= 900;
-
-if (!isMobile) {
-  const appEl = document.getElementById("app");
-  const pcBlockEl = document.getElementById("pc-block");
-  if (appEl) appEl.style.display = "none";
-  if (pcBlockEl) pcBlockEl.style.display = "block";
-  throw new Error("Non-mobile access blocked");
-}
-
 const TARGET_SAMPLE_RATE = 44100;
 const STEM_KEYS = ["vocals", "accompaniment"];
 
