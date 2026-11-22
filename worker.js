@@ -1,23 +1,24 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
 
-const VOCALS_MODEL_URL =
-  "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/vocals.onnx?download=true";
-const ACCOMPANIMENT_MODEL_URL =
-  "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/accompaniment.onnx?download=true";
+const MODEL_URLS = {
+  vocals:
+    "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/vocals.onnx?download=true",
+  accompaniment:
+    "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/accompaniment.onnx?download=true",
+};
 
+const MODEL_CACHE_NAME = "wing-spleeter-onnx-cache-v1";
 const STEM_KEYS = ["vocals", "accompaniment"];
 
 // Spleeter 44.1kHz 標準 STFT パラメータ
 const N_FFT = 4096;
 const HOP_LENGTH = 1024;
 const FREQ_BINS = N_FFT / 2 + 1; // 2049
-const MODEL_BINS = 1024; // U-Net 入力周波数ビン数 (~11kHz相当)
+const MODEL_BINS = 1024;
 
-// チャンク処理用（約12秒ごとの分割＋オーバーラップで継ぎ目を軽減）
-const CHUNK_SAMPLES = 44100 * 12;
-const OVERLAP_SAMPLES = 44100 * 1;
-
-let sessions = null;
+// メモリ負荷を抑えるため 6秒チャンク + 0.5秒オーバーラップに設定
+const CHUNK_SAMPLES = 44100 * 6;
+const OVERLAP_SAMPLES = Math.floor(44100 * 0.5);
 
 function createPeriodicHannWindow(length) {
   const win = new Float32Array(length);
@@ -29,29 +30,81 @@ function createPeriodicHannWindow(length) {
 
 const HANN_WINDOW = createPeriodicHannWindow(N_FFT);
 
-async function initModels() {
-  if (sessions) return sessions;
+/**
+ * ブラウザの Cache Storage からモデルバイナリを取得（初回のみDLして保存、2回目以降はキャッシュ利用）
+ */
+async function loadModelArrayBuffer(stemKey, url) {
+  const cacheSupported = typeof caches !== "undefined";
+
+  if (cacheSupported) {
+    const cache = await caches.open(MODEL_CACHE_NAME);
+    const cachedResponse = await cache.match(url);
+    if (cachedResponse && cachedResponse.ok) {
+      postMessage({
+        type: "progress",
+        message: `[${stemKey}] 保存済みキャッシュからモデル読込中...`,
+      });
+      return await cachedResponse.arrayBuffer();
+    }
+
+    postMessage({
+      type: "progress",
+      message: `[${stemKey}] モデルを初回ダウンロード＆ブラウザ保存中...`,
+    });
+
+    const response = await fetch(url);
+    if (!response.ok) {
+      throw new Error(`${stemKey} モデルの取得に失敗しました (HTTP ${response.status})`);
+    }
+
+    // キャッシュ保存用にクローンして格納
+    await cache.put(url, response.clone());
+    return await response.arrayBuffer();
+  }
 
   postMessage({
     type: "progress",
-    message: "2ステム用AIモデル (vocals / accompaniment) を読み込み中...",
+    message: `[${stemKey}] モデルをダウンロード中...`,
   });
 
-  const [vocalsSession, accompanimentSession] = await Promise.all([
-    ort.InferenceSession.create(VOCALS_MODEL_URL, {
-      executionProviders: ["wasm"],
-    }),
-    ort.InferenceSession.create(ACCOMPANIMENT_MODEL_URL, {
-      executionProviders: ["wasm"],
-    }),
-  ]);
+  const response = await fetch(url);
+  if (!response.ok) {
+    throw new Error(`${stemKey} モデルの取得に失敗しました (HTTP ${response.status})`);
+  }
+  return await response.arrayBuffer();
+}
 
-  sessions = {
-    vocals: vocalsSession,
-    accompaniment: accompanimentSession,
-  };
+/**
+ * 1モデル分のセッションをロード
+ */
+async function createSingleSession(stemKey) {
+  const url = MODEL_URLS[stemKey];
+  const modelBuffer = await loadModelArrayBuffer(stemKey, url);
 
-  return sessions;
+  postMessage({
+    type: "progress",
+    message: `[${stemKey}] AIセッションを展開中...`,
+  });
+
+  const session = await ort.InferenceSession.create(new Uint8Array(modelBuffer), {
+    executionProviders: ["wasm"],
+  });
+
+  return session;
+}
+
+/**
+ * セッションを明示的に解放
+ */
+async function releaseSession(session) {
+  if (!session) return;
+  try {
+    if (typeof session.release === "function") {
+      await session.release();
+    }
+  } catch (_) {
+    // 解放時の軽微なエラーは無視
+  }
 }
 
 /**
@@ -77,7 +130,7 @@ function fftInPlace(re, im, dir) {
 
   for (let len = 2; len <= n; len <<= 1) {
     const half = len >> 1;
-    const ang = ((dir * -2 * Math.PI) / len);
+    const ang = (dir * -2 * Math.PI) / len;
     const wLenR = Math.cos(ang);
     const wLenI = Math.sin(ang);
 
@@ -88,7 +141,7 @@ function fftInPlace(re, im, dir) {
         const uR = re[i + k];
         const uI = im[i + k];
         const vR = re[i + k + half] * wR - im[i + k + half] * wI;
-        const vI = re[i + k + half] * wR ? re[i + k + half] * wI + im[i + k + half] * wR : re[i + k + half] * wI + im[i + k + half] * wR;
+        const vI = re[i + k + half] * wI + im[i + k + half] * wR;
 
         re[i + k] = uR + vR;
         im[i + k] = uI + vI;
@@ -110,10 +163,6 @@ function fftInPlace(re, im, dir) {
   }
 }
 
-/**
- * 1チャンネル波形から STFT を計算
- * 戻り値: { numFrames, re: Float32Array[numFrames * FREQ_BINS], im: Float32Array[numFrames * FREQ_BINS] }
- */
 function computeStft(samples) {
   const numFrames = Math.max(1, Math.floor((samples.length - N_FFT) / HOP_LENGTH) + 1);
   const reOut = new Float32Array(numFrames * FREQ_BINS);
@@ -143,9 +192,6 @@ function computeStft(samples) {
   return { numFrames, re: reOut, im: imOut };
 }
 
-/**
- * 複素 STFT から iSTFT で波形へ復元
- */
 function computeIstft(reSpec, imSpec, numFrames, outputLength) {
   const out = new Float32Array(outputLength);
   const norm = new Float32Array(outputLength);
@@ -191,10 +237,6 @@ function computeIstft(reSpec, imSpec, numFrames, outputLength) {
   return out;
 }
 
-/**
- * モデルの入力次元に合わせて振幅テンソルを組み立てる
- * 代表的な Spleeter ONNX 入力形状: [2, num_splits, 512, 1024]
- */
 function buildSpleeterInputTensor(session, leftStft, rightStft) {
   const inputName = session.inputNames[0];
   const meta = session.inputMetadata?.[inputName];
@@ -219,7 +261,7 @@ function buildSpleeterInputTensor(session, leftStft, rightStft) {
     for (let sp = 0; sp < numSplits; sp++) {
       for (let t = 0; t < axis2; t++) {
         const frameIdx = sp * axis2 + t;
-        const dstOffset = (((c * numSplits + sp) * axis2 + t) * freqBins);
+        const dstOffset = ((c * numSplits + sp) * axis2 + t) * freqBins;
 
         if (frameIdx < totalFrames) {
           const srcOffset = frameIdx * FREQ_BINS;
@@ -242,149 +284,117 @@ function buildSpleeterInputTensor(session, leftStft, rightStft) {
   };
 }
 
-/**
- * モデル出力（振幅またはマスク）を元の複素 STFT に適用して復元する
- */
-function applyModelOutputToStft(outTensor, stft, metaInfo) {
+function reconChannelWithTensor(stftObj, chIdx, outTensor, metaInfo, outputLength) {
   const { numSplits, axis2, freqBins } = metaInfo;
+  const dims = outTensor.dims || [];
+  const chCountInOut = dims.length >= 1 && dims[0] >= 2 ? 2 : 1;
   const outData = outTensor.data;
-  const totalFrames = stft.numFrames;
+  const totalFrames = stftObj.numFrames;
 
-  const maskedRe = new Float32Array(stft.re.length);
-  const maskedIm = new Float32Array(stft.im.length);
+  const mRe = new Float32Array(stftObj.re.length);
+  const mIm = new Float32Array(stftObj.im.length);
 
   for (let f = 0; f < totalFrames; f++) {
     const sp = Math.floor(f / axis2);
     const t = f % axis2;
     const base = f * FREQ_BINS;
 
-    // 11kHz以上の高域帯域はフレーム平均ゲインで補完
-    let bandMeanGain = 1.0;
-    if (sp < numSplits) {
-      let sumRatio = 0;
-      let count = 0;
-      const checkBins = Math.min(freqBins, FREQ_BINS);
-      for (let b = 0; b < checkBins; b++) {
-        const r = stft.re[base + b];
-        const im = stft.im[base + b];
-        const origMag = Math.hypot(r, im);
-        if (origMag > 1e-6) {
-          const outIdx = (((0 * numSplits + sp) * axis2 + t) * freqBins) + b;
-          const predVal = outData[outIdx] ?? origMag;
-          sumRatio += Math.max(0, Math.min(1.5, predVal / origMag));
-          count++;
-        }
-      }
-      if (count > 0) {
-        bandMeanGain = sumRatio / count;
-      }
-    }
-
     for (let b = 0; b < FREQ_BINS; b++) {
-      const r = stft.re[base + b];
-      const im = stft.im[base + b];
+      const r = stftObj.re[base + b];
+      const im = stftObj.im[base + b];
       const origMag = Math.hypot(r, im);
 
-      let gain = bandMeanGain;
+      let gain = 1.0;
       if (sp < numSplits && b < freqBins) {
-        const outIdx = (((0 * numSplits + sp) * axis2 + t) * freqBins) + b;
+        const actualCh = chCountInOut >= 2 ? chIdx : 0;
+        const outIdx = ((actualCh * numSplits + sp) * axis2 + t) * freqBins + b;
         const predVal = outData[outIdx];
         if (typeof predVal === "number" && Number.isFinite(predVal)) {
-          // predVal が推定振幅に近い場合は比率を、マスク値(0..1)に近い場合はそのまま適用
           gain = origMag > 1e-6 ? Math.max(0, Math.min(2.0, predVal / origMag)) : 0;
         }
       }
 
-      maskedRe[base + b] = r * gain;
-      maskedIm[base + b] = im * gain;
+      mRe[base + b] = r * gain;
+      mIm[base + b] = im * gain;
     }
   }
 
-  return maskedRe, maskedIm;
+  const audio = computeIstft(mRe, mIm, totalFrames, outputLength);
+  return audio;
 }
 
 /**
- * 1チャンク分のステレオ音声を 2ステム (vocals / accompaniment) に分離
+ * 1つのモデル（vocals または accompaniment）について全チャンクを処理
  */
-async function separateChunk(loadedSessions, leftChunk, rightChunk) {
-  const leftStft = computeStft(leftChunk);
-  const rightStft = computeStft(rightChunk);
+async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
+  const totalLength = left.length;
+  const step = Math.max(1, CHUNK_SAMPLES - OVERLAP_SAMPLES);
+  const totalChunks = Math.max(1, Math.ceil(totalLength / step));
 
-  const chunkResult = {
-    vocals: {
-      left: new Float32Array(leftChunk.length),
-      right: new Float32Array(rightChunk.length),
-    },
-    accompaniment: {
-      left: new Float32Array(leftChunk.length),
-      right: new Float32Array(rightChunk.length),
-    },
-  };
+  let session = null;
 
-  for (const key of STEM_KEYS) {
-    const session = loadedSessions[key];
+  try {
+    session = await createSingleSession(stemKey);
     const inputName = session.inputNames[0];
     const outputName = session.outputNames[0];
 
-    const built = buildSpleeterInputTensor(session, leftStft, rightStft);
-    const results = await session.run({ [inputName]: built.tensor });
-    const outTensor = results[outputName];
+    for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+      const start = chunkIdx * step;
+      if (start >= totalLength) break;
 
-    if (!outTensor) {
-      built.tensor.dispose();
-      throw new Error(`出力 "${outputName}" (${key}) が取得できませんでした。`);
-    }
+      const end = Math.min(totalLength, start + CHUNK_SAMPLES);
+      const pct = Math.round(((chunkIdx + 1) / totalChunks) * 100);
 
-    // 左右チャンネルそれぞれの出力を復元
-    const dims = outTensor.dims || [];
-    const chCountInOut = dims.length >= 1 && dims[0] >= 2 ? 2 : 1;
+      postMessage({
+        type: "progress",
+        message: `[${stemKey}] 分離計算中... ${pct}% (${chunkIdx + 1}/${totalChunks})`,
+      });
 
-    const reconChannel = (stftObj, chIdx) => {
-      const spCount = built.numSplits;
-      const tCount = built.axis2;
-      const fCount = built.freqBins;
-      const outData = outTensor.data;
-      const totalFrames = stftObj.numFrames;
+      const leftSlice = left.subarray(start, end);
+      const rightSlice = right.subarray(start, end);
 
-      const mRe = new Float32Array(stftObj.re.length);
-      const mIm = new Float32Array(stftObj.im.length);
+      let leftStft = computeStft(leftSlice);
+      let rightStft = computeStft(rightSlice);
 
-      for (let f = 0; f < totalFrames; f++) {
-        const sp = Math.floor(f / tCount);
-        const t = f % tCount;
-        const base = f * FREQ_BINS;
+      const built = buildSpleeterInputTensor(session, leftStft, rightStft);
+      const results = await session.run({ [inputName]: built.tensor });
+      const outTensor = results[outputName];
 
-        for (let b = 0; b < FREQ_BINS; b++) {
-          const r = stftObj.re[base + b];
-          const im = stftObj.im[base + b];
-          const origMag = Math.hypot(r, im);
-
-          let gain = 1.0;
-          if (sp < spCount && b < fCount) {
-            const actualCh = chCountInOut >= 2 ? chIdx : 0;
-            const outIdx = (((actualCh * spCount + sp) * tCount + t) * fCount) + b;
-            const predVal = outData[outIdx];
-            if (typeof predVal === "number" && Number.isFinite(predVal)) {
-              gain = origMag > 1e-6 ? Math.max(0, Math.min(2.0, predVal / origMag)) : 0;
-            }
-          }
-
-          mRe[base + b] = r * gain;
-          mIm[base + b] = im * gain;
-        }
+      if (!outTensor) {
+        built.tensor.dispose();
+        throw new Error(`出力 "${outputName}" (${stemKey}) が取得できませんでした。`);
       }
 
-      return computeIstft(mRe, mIm, totalFrames, leftChunk.length);
-    };
+      const outL = reconChannelWithTensor(leftStft, 0, outTensor, built, leftSlice.length);
+      const outR = reconChannelWithTensor(rightStft, 1, outTensor, built, rightSlice.length);
 
-    chunkResult[key].left = reconChannel(leftStft, 0);
-    chunkResult[key].right = reconChannel(rightStft, 1);
+      // チャンク用テンソル・STFT配列を即座に破棄
+      built.tensor.dispose();
+      outTensor.dispose();
+      leftStft = null;
+      rightStft = null;
 
-    built.tensor.dispose();
-    outTensor.dispose();
+      for (let i = 0; i < outL.length; i++) {
+        const outIdx = start + i;
+        if (outIdx >= totalLength) break;
+
+        const overlapStart = outL.length - OVERLAP_SAMPLES;
+        if (chunkIdx < totalChunks - 1 && OVERLAP_SAMPLES > 0 && i >= overlapStart) {
+          const t = (i - overlapStart) / OVERLAP_SAMPLES;
+          const fadeOut = 1 - t;
+          dstLeft[outIdx] = dstLeft[outIdx] * fadeOut + outL[i] * t;
+          dstRight[outIdx] = dstRight[outIdx] * fadeOut + outR[i] * t;
+        } else if (i < step || chunkIdx === totalChunks - 1) {
+          dstLeft[outIdx] = outL[i];
+          dstRight[outIdx] = outR[i];
+        }
+      }
+    }
+  } finally {
+    // 次のモデルに移る前に必ずセッションを解放
+    await releaseSession(session);
+    session = null;
   }
-
-  return chunkResult;
 }
 
 function clampBuffer(buf) {
@@ -399,8 +409,6 @@ self.onmessage = async (e) => {
     const { sampleRate, left, right } = e.data;
     const totalLength = left.length;
 
-    const loadedSessions = await initModels();
-
     const finalStems = {
       vocals: {
         left: new Float32Array(totalLength),
@@ -412,61 +420,23 @@ self.onmessage = async (e) => {
       },
     };
 
-    const step = Math.max(1, CHUNK_SAMPLES - OVERLAP_SAMPLES);
-    const totalChunks = Math.max(1, Math.ceil(totalLength / step));
-
-    for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-      const start = chunkIdx * step;
-      if (start >= totalLength) break;
-
-      const end = Math.min(totalLength, start + CHUNK_SAMPLES);
-      const pct = Math.round((chunkIdx / totalChunks) * 100);
-
-      postMessage({
-        type: "progress",
-        message: `2 パート分離を計算中... (${pct}%)`,
-      });
-
-      const leftSlice = left.subarray(start, end);
-      const rightSlice = right.subarray(start, end);
-
-      const chunkOut = await separateChunk(loadedSessions, leftSlice, rightSlice);
-
-      for (const key of STEM_KEYS) {
-        const dstL = finalStems[key].left;
-        const dstR = finalStems[key].right;
-        const srcL = chunkOut[key].left;
-        const srcR = chunkOut[key].right;
-
-        for (let i = 0; i < srcL.length; i++) {
-          const outIdx = start + i;
-          if (outIdx >= totalLength) break;
-
-          // オーバーラップ領域はクロスフェードで滑らかに接続
-          const overlapStart = srcL.length - OVERLAP_SAMPLES;
-          if (chunkIdx < totalChunks - 1 && OVERLAP_SAMPLES > 0 && i >= overlapStart) {
-            const t = (i - overlapStart) / OVERLAP_SAMPLES;
-            const fadeOut = 1 - t;
-            dstL[outIdx] = dstL[outIdx] * fadeOut + srcL[i] * t;
-            dstR[outIdx] = dstR[outIdx] * fadeOut + srcR[i] * t;
-          } else if (outIdx < start + step || chunkIdx === totalChunks - 1) {
-            if (i < step || chunkIdx === totalChunks - 1) {
-              dstL[outIdx] = srcL[i];
-              dstR[outIdx] = srcR[i];
-            }
-          }
-        }
-      }
-    }
-
-    for (const key of STEM_KEYS) {
+    // 1モデルずつ順番にロード・推論・解放して同時メモリ使用量を抑える
+    for (let i = 0; i < STEM_KEYS.length; i++) {
+      const key = STEM_KEYS[i];
+      await processSingleStem(
+        key,
+        left,
+        right,
+        finalStems[key].left,
+        finalStems[key].right
+      );
       clampBuffer(finalStems[key].left);
       clampBuffer(finalStems[key].right);
     }
 
     postMessage({
       type: "progress",
-      message: "2 パート分のWAVファイルを生成中...",
+      message: "2 パート分のWAVデータを転送中...",
     });
 
     const transferBuffers = [];
