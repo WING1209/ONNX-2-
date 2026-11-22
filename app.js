@@ -69,7 +69,9 @@ async function normalizeTo44100Stereo(decodedBuffer) {
   source.buffer = inputForRender;
   source.connect(offlineCtx.destination);
   source.start(0);
-  return await offlineCtx.startRendering();
+  const rendered = await offlineCtx.startRendering();
+  source.disconnect();
+  return rendered;
 }
 
 fileInput.addEventListener("change", (e) => {
@@ -88,14 +90,14 @@ fileInput.addEventListener("change", (e) => {
   runBtn.disabled = false;
   const mb = (file.size / 1024 / 1024).toFixed(2);
   fileSub.textContent = `${file.name} (${mb} MB)`;
-  statusEl.textContent = `選択完了: ${file.name} - 「2 パート分離を実行」を押してください。`;
+  statusEl.textContent = `選択完了: ${file.name} - 「2 パート分離を実行！」を押してください。`;
 });
 
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
   resetDownloadLinks();
-  statusEl.textContent = "音声データを読み込み中...";
+  statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
     const arrayBuffer = await selectedFile.arrayBuffer();
@@ -116,14 +118,14 @@ runBtn.addEventListener("click", async () => {
       audioBuffer.numberOfChannels !== 2;
 
     if (needsConvert) {
-      statusEl.textContent = `44100Hz・ステレオに変換中... (元: ${audioBuffer.sampleRate}Hz / ${audioBuffer.numberOfChannels}ch)`;
+      statusEl.textContent = `ステップ1/3: 44100Hz・ステレオに変換中... (元: ${audioBuffer.sampleRate}Hz / ${audioBuffer.numberOfChannels}ch)`;
     }
 
     const normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
-    statusEl.textContent = "バックグラウンドで2パート分離中...";
+    statusEl.textContent = "ステップ2/3: モデル確認・パート別分離を開始中...";
     worker.postMessage(
       {
         sampleRate: normalizedBuffer.sampleRate,
@@ -182,14 +184,20 @@ worker.onmessage = (e) => {
   if (type === "progress") {
     statusEl.textContent = message;
   } else if (type === "done") {
-    STEM_KEYS.forEach((k) => {
+    statusEl.textContent = "ステップ3/3: WAVファイルを順次生成中...";
+
+    for (const k of STEM_KEYS) {
       const link = document.getElementById(`dl-${k}`);
       if (link && stems?.[k]) {
         const blob = encodeWav(stems[k].left, stems[k].right, sampleRate);
         link.href = URL.createObjectURL(blob);
         link.classList.remove("disabled");
+        // 生成済みの配列参照を順次解放してメモリ圧迫を軽減
+        stems[k].left = null;
+        stems[k].right = null;
       }
-    });
+    }
+
     statusEl.textContent = "完了! 2パートそれぞれのWAVを保存できます。";
     runBtn.disabled = false;
   } else if (type === "error") {
