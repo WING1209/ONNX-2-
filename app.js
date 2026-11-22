@@ -1,7 +1,13 @@
-const APP_VERSION = "Ver.1.8";
+const APP_VERSION = "Ver.1.10";
 const TARGET_SAMPLE_RATE = 44100;
-// iOSメモリ節約のため保存WAVを22050Hzに設定（44100Hzにしたい場合は 44100 に変更可能）
+
+// iOSのメモリピークを抑える軽量出力設定
 const OUTPUT_SAMPLE_RATE = 22050;
+const OUTPUT_CHANNELS = 1;
+
+// ブラウザのユーザー操作制約があるため、通常は false（完了後ボタン点灯→タップで保存）を推奨
+// 必要に応じて true にすると完了直後に自動ダウンロード試行を行います
+const AUTO_TRIGGER_DOWNLOAD_ON_DONE = false;
 
 const fileInput = document.getElementById("audioFile");
 const fileSub = document.getElementById("fileSub");
@@ -98,16 +104,27 @@ async function normalizeTo44100Stereo(decodedBuffer) {
   return rendered;
 }
 
-function resampleLinearStereo(chL, chR, srcRate, dstRate) {
-  if (srcRate === dstRate || chL.length === 0) {
-    return { outL: chL, outR: chR, rate: srcRate };
-  }
-
+function buildOutputSamples(chL, chR, srcRate, dstRate, outChannels) {
   const ratio = srcRate / dstRate;
   const outLen = Math.max(1, Math.floor(chL.length / ratio));
+
+  if (outChannels === 1) {
+    const outMono = new Float32Array(outLen);
+    for (let i = 0; i < outLen; i++) {
+      const srcPos = i * ratio;
+      const idx0 = Math.floor(srcPos);
+      const idx1 = Math.min(chL.length - 1, idx0 + 1);
+      const frac = srcPos - idx0;
+
+      const sL = chL[idx0] * (1 - frac) + chL[idx1] * frac;
+      const sR = chR[idx0] * (1 - frac) + chR[idx1] * frac;
+      outMono[i] = 0.5 * (sL + sR);
+    }
+    return { channels: [outMono], rate: dstRate };
+  }
+
   const outL = new Float32Array(outLen);
   const outR = new Float32Array(outLen);
-
   for (let i = 0; i < outLen; i++) {
     const srcPos = i * ratio;
     const idx0 = Math.floor(srcPos);
@@ -117,8 +134,54 @@ function resampleLinearStereo(chL, chR, srcRate, dstRate) {
     outL[i] = chL[idx0] * (1 - frac) + chL[idx1] * frac;
     outR[i] = chR[idx0] * (1 - frac) + chR[idx1] * frac;
   }
+  return { channels: [outL, outR], rate: dstRate };
+}
 
-  return { outL, outR, rate: dstRate };
+async function triggerDownloadOrShare(allowShareSheet = true) {
+  if (!currentAudioBlob || currentAudioBlob.size <= 44) {
+    statusEl.textContent = "保存できる音声データがありません。";
+    return;
+  }
+
+  if (allowShareSheet && isIosDevice() && typeof navigator.share === "function") {
+    try {
+      const wavFile = new File([currentAudioBlob], currentFileName, {
+        type: "audio/wav",
+      });
+      if (typeof navigator.canShare !== "function" || navigator.canShare({ files: [wavFile] })) {
+        await navigator.share({
+          files: [wavFile],
+          title: currentFileName,
+        });
+        statusEl.textContent = `共有メニューを開きました: ${currentFileName}`;
+        return;
+      }
+    } catch (shareErr) {
+      if (shareErr?.name === "AbortError") {
+        statusEl.textContent = "保存をキャンセルしました。";
+        return;
+      }
+    }
+  }
+
+  try {
+    if (!currentBlobUrl) {
+      currentBlobUrl = URL.createObjectURL(currentAudioBlob);
+    }
+
+    const tempLink = document.createElement("a");
+    tempLink.href = currentBlobUrl;
+    tempLink.download = currentFileName;
+    tempLink.rel = "noopener";
+    tempLink.style.display = "none";
+    document.body.appendChild(tempLink);
+    tempLink.click();
+    document.body.removeChild(tempLink);
+
+    statusEl.textContent = `保存処理を実行しました: ${currentFileName}`;
+  } catch (err) {
+    statusEl.textContent = `ダウンロードエラー: ${err.message}`;
+  }
 }
 
 function attachWorkerHandlers(w) {
@@ -128,12 +191,11 @@ function attachWorkerHandlers(w) {
     if (type === "progress") {
       statusEl.textContent = message;
     } else if (type === "done") {
-      // 抽出完了後にワーカーを終了して WASM ヒープを早めに解放
       terminateWorkerSafely();
       statusEl.textContent = "ステップ3/3: 音声ファイルを生成中...";
 
       try {
-        await yieldTick(50);
+        await yieldTick(30);
 
         if (accompaniment) {
           let chL = accompaniment.left;
@@ -141,22 +203,21 @@ function attachWorkerHandlers(w) {
           accompaniment.left = null;
           accompaniment.right = null;
 
-          const resampled = resampleLinearStereo(
+          const builtOut = buildOutputSamples(
             chL,
             chR,
             sampleRate || TARGET_SAMPLE_RATE,
-            OUTPUT_SAMPLE_RATE
+            OUTPUT_SAMPLE_RATE,
+            OUTPUT_CHANNELS
           );
           chL = null;
           chR = null;
 
           currentAudioBlob = await encodeWavBlobChunked(
-            resampled.outL,
-            resampled.outR,
-            resampled.rate
+            builtOut.channels,
+            builtOut.rate
           );
-          resampled.outL = null;
-          resampled.outR = null;
+          builtOut.channels = null;
 
           if (dlBtn) {
             dlBtn.disabled = false;
@@ -164,6 +225,10 @@ function attachWorkerHandlers(w) {
         }
 
         statusEl.textContent = "完了! 「音声 保存」を押して保存してください。";
+
+        if (AUTO_TRIGGER_DOWNLOAD_ON_DONE && dlBtn && !dlBtn.disabled) {
+          await triggerDownloadOrShare(false);
+        }
       } catch (err) {
         statusEl.textContent = `音声生成エラー: ${err.message}`;
       } finally {
@@ -238,7 +303,7 @@ runBtn.addEventListener("click", async () => {
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
-    worker = new Worker("worker.js?v=1.8", { type: "module" });
+    worker = new Worker("worker.js?v=1.10", { type: "module" });
     attachWorkerHandlers(worker);
 
     statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
@@ -257,9 +322,9 @@ runBtn.addEventListener("click", async () => {
   }
 });
 
-async function encodeWavBlobChunked(chL, chR, sampleRate) {
-  const numChannels = 2;
-  const length = Math.min(chL.length, chR.length);
+async function encodeWavBlobChunked(channels, sampleRate) {
+  const numChannels = channels.length;
+  const length = channels[0].length;
   const headerBuf = new ArrayBuffer(44);
   const headerView = new DataView(headerBuf);
 
@@ -284,7 +349,7 @@ async function encodeWavBlobChunked(chL, chR, sampleRate) {
   headerView.setUint32(40, length * numChannels * 2, true);
 
   const parts = [headerBuf];
-  const chunkSamples = Math.max(1, sampleRate * 4); // 約4秒単位で分割生成
+  const chunkSamples = Math.max(1, sampleRate * 2);
 
   for (let start = 0; start < length; start += chunkSamples) {
     const end = Math.min(length, start + chunkSamples);
@@ -294,11 +359,11 @@ async function encodeWavBlobChunked(chL, chR, sampleRate) {
 
     let offset = 0;
     for (let i = 0; i < segLen; i++) {
-      const sL = Math.max(-1, Math.min(1, chL[start + i]));
-      const sR = Math.max(-1, Math.min(1, chR[start + i]));
-      segView.setInt16(offset, sL < 0 ? sL * 0x8000 : sL * 0x7fff, true);
-      segView.setInt16(offset + 2, sR < 0 ? sR * 0x8000 : sR * 0x7fff, true);
-      offset += 4;
+      for (let c = 0; c < numChannels; c++) {
+        const s = Math.max(-1, Math.min(1, channels[c][start + i]));
+        segView.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+        offset += 2;
+      }
     }
 
     parts.push(segBuf);
@@ -309,48 +374,5 @@ async function encodeWavBlobChunked(chL, chR, sampleRate) {
 }
 
 dlBtn.addEventListener("click", async () => {
-  if (!currentAudioBlob || currentAudioBlob.size <= 44) {
-    statusEl.textContent = "保存できる音声データがありません。";
-    return;
-  }
-
-  if (isIosDevice() && typeof navigator.share === "function") {
-    try {
-      const wavFile = new File([currentAudioBlob], currentFileName, {
-        type: "audio/wav",
-      });
-      if (typeof navigator.canShare !== "function" || navigator.canShare({ files: [wavFile] })) {
-        await navigator.share({
-          files: [wavFile],
-          title: currentFileName,
-        });
-        statusEl.textContent = `共有メニューを開きました: ${currentFileName}`;
-        return;
-      }
-    } catch (shareErr) {
-      if (shareErr?.name === "AbortError") {
-        statusEl.textContent = "保存をキャンセルしました。";
-        return;
-      }
-    }
-  }
-
-  try {
-    if (!currentBlobUrl) {
-      currentBlobUrl = URL.createObjectURL(currentAudioBlob);
-    }
-
-    const tempLink = document.createElement("a");
-    tempLink.href = currentBlobUrl;
-    tempLink.download = currentFileName;
-    tempLink.rel = "noopener";
-    tempLink.style.display = "none";
-    document.body.appendChild(tempLink);
-    tempLink.click();
-    document.body.removeChild(tempLink);
-
-    statusEl.textContent = `保存処理を実行しました: ${currentFileName}`;
-  } catch (err) {
-    statusEl.textContent = `ダウンロードエラー: ${err.message}`;
-  }
+  await triggerDownloadOrShare(true);
 });
