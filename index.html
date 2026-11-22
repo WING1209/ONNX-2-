@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>WING -2 Stem Separation-</title>
+<style>
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  padding: 16px;
+  font-family: -apple-system, BlinkMacSystemFont, "Hiragino Maru Gothic ProN", "Rounded Mplus 1c", "Segoe UI", Roboto, sans-serif;
+  background-color: #fffbeb;
+  background-image:
+    radial-gradient(#fde047 2.2px, transparent 2.2px),
+    radial-gradient(#f472b6 2px, #fffbeb 2px);
+  background-size: 28px 28px;
+  background-position: 0 0, 14px 14px;
+  color: #1e1b4b;
+  min-height: 100vh;
+}
+.box {
+  max-width: 480px;
+  margin: 0 auto;
+  background: rgba(255, 255, 255, 0.92);
+  border: 3px solid #1e1b4b;
+  border-radius: 26px;
+  padding: 18px 16px 22px;
+  box-shadow: 7px 7px 0px #1e1b4b;
+}
+.app-title {
+  text-align: center;
+  font-size: 1.28rem;
+  font-weight: 900;
+  letter-spacing: 0.04em;
+  margin: 0 0 16px;
+  padding: 13px 12px;
+  border-radius: 18px;
+  border: 3px solid #1e1b4b;
+  background: linear-gradient(95deg, #ff5ca8 0%, #ffbe0b 50%, #00bbf9 100%);
+  color: #1e1b4b;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.75);
+  box-shadow: 4px 4px 0px #1e1b4b;
+  transform: rotate(-1deg);
+}
+.file-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 92px;
+  padding: 18px 14px;
+  border: 3px dashed #ff4d8d;
+  border-radius: 20px;
+  background: #fff0f6;
+  color: #1e1b4b;
+  font-size: 1.05rem;
+  font-weight: 800;
+  text-align: center;
+  cursor: pointer;
+  box-shadow: 4px 4px 0px #ff9ebb;
+  transition: transform 0.12s ease, background 0.15s ease, box-shadow 0.12s ease;
+}
+.file-label:hover {
+  background: #ffe3ee;
+}
+.file-label:active {
+  background: #ffd1e3;
+  transform: translate(3px, 3px);
+  box-shadow: 1px 1px 0px #ff9ebb;
+}
+.file-sub {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #6b21a8;
+  background: #f3e8ff;
+  padding: 3px 10px;
+  border-radius: 999px;
+}
+input[type="file"] {
+  display: none;
+}
+.btn {
+  display: block;
+  width: 100%;
+  padding: 16px;
+  margin-top: 14px;
+  font-size: 1.08rem;
+  font-weight: 900;
+  letter-spacing: 0.03em;
+  border: 3px solid #1e1b4b;
+  border-radius: 18px;
+  background: linear-gradient(90deg, #38bdf8 0%, #4ade80 100%);
+  color: #1e1b4b;
+  box-shadow: 5px 5px 0px #1e1b4b;
+  cursor: pointer;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+.btn:hover:not(:disabled) {
+  filter: brightness(1.03);
+}
+.btn:active:not(:disabled) {
+  transform: translate(4px, 4px);
+  box-shadow: 1px 1px 0px #1e1b4b;
+}
+.btn:disabled {
+  background: #e2e8f0;
+  color: #64748b;
+  border-color: #94a3b8;
+  box-shadow: 3px 3px 0px #cbd5e1;
+  cursor: not-allowed;
+}
+.status {
+  margin-top: 14px;
+  padding: 11px 14px;
+  border-radius: 16px;
+  background: #fef9c3;
+  border: 2.5px solid #1e1b4b;
+  box-shadow: 3px 3px 0px #1e1b4b;
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: #1e1b4b;
+  word-break: break-all;
+}
+#results {
+  margin-top: 16px;
+  display: grid;
+  gap: 12px;
+}
+.stem {
+  padding: 13px 14px;
+  border-radius: 18px;
+  background: #ffffff;
+  border: 2.5px solid #1e1b4b;
+  border-left-width: 9px;
+  box-shadow: 4px 4px 0px #1e1b4b;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+}
+.stem-name {
+  font-weight: 900;
+  font-size: 0.96rem;
+  color: #1e1b4b;
+}
+.stem-vocals {
+  border-left-color: #ec4899;
+  background: #fdf2f8;
+}
+.stem-accompaniment {
+  border-left-color: #0ea5e9;
+  background: #f0f9ff;
+}
+.stem a {
+  color: #ffffff;
+  background: linear-gradient(90deg, #ff4d8d, #fb923c);
+  border: 2px solid #1e1b4b;
+  box-shadow: 3px 3px 0px #1e1b4b;
+  text-decoration: none;
+  font-size: 0.85rem;
+  font-weight: 800;
+  padding: 8px 13px;
+  border-radius: 12px;
+  white-space: nowrap;
+  transition: transform 0.1s ease, box-shadow 0.1s ease;
+}
+.stem a:active:not(.disabled) {
+  transform: translate(2px, 2px);
+  box-shadow: 1px 1px 0px #1e1b4b;
+}
+.stem a.disabled {
+  opacity: 0.45;
+  pointer-events: none;
+  background: #cbd5e1;
+  color: #475569;
+  border-color: #94a3b8;
+  box-shadow: none;
+}
+#pc-block {
+  display: none;
+  text-align: center;
+  max-width: 420px;
+  margin: 40px auto 0;
+  padding: 28px 20px;
+  background: #ffffff;
+  border: 3px solid #1e1b4b;
+  border-radius: 24px;
+  box-shadow: 6px 6px 0px #1e1b4b;
+}
+</style>
+</head>
+<body>
+<div id="pc-block">
+  <h2>📱 スマートフォン専用です</h2>
+  <p>このページはスマートフォンからのみご利用いただけます。</p>
+</div>
+<div class="box" id="app">
+  <header class="app-title">✨【WING】2 Stem Pop Studio 🎶</header>
+  <label for="audioFile" class="file-label" id="fileLabel">
+    <span>♫♪ 音源ファイルを選択 (タップ) ✨</span>
+    <span class="file-sub" id="fileSub">対応形式: MP3 / WAV (44100Hz・ステレオ)</span>
+  </label>
+  <input type="file" id="audioFile" accept=".mp3, .wav, audio/mpeg, audio/wav">
+  <button id="runBtn" class="btn" disabled>🚀 2 パート分離を実行！</button>
+  <div id="status" class="status">MP3 または WAVファイルを選択してください。</div>
+  <div id="results">
+    <div class="stem stem-vocals">
+      <span class="stem-name">🎤 ① ボーカル (Vocals)</span>
+      <a id="dl-vocals" class="disabled" download="vocals.wav">WAV 保存</a>
+    </div>
+    <div class="stem stem-accompaniment">
+      <span class="stem-name">🎸 ② 伴奏 (Accompaniment)</span>
+      <a id="dl-accompaniment" class="disabled" download="accompaniment.wav">WAV 保存</a>
+    </div>
+  </div>
+</div>
+<script type="module" src="app.js"></script>
+</body>
+</html>
