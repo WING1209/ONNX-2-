@@ -1,6 +1,6 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
 
-// iOS Safari でのクラッシュ・WASMメモリ膨張を抑える設定
+// メモリ膨張を抑える設定
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 ort.env.wasm.simd = false;
@@ -18,14 +18,14 @@ const FREQ_BINS = N_FFT / 2 + 1; // 2049
 // モデル入力 x の仕様: [channels, splits, frames=512, bins=1024]
 const MODEL_FRAMES = 512;
 const MODEL_BINS = 1024;
-const BLOCK_SAMPLES = MODEL_FRAMES * HOP_LENGTH; // 524,288 サンプル (約11.89秒)
+const BLOCK_SAMPLES = MODEL_FRAMES * HOP_LENGTH; // 524,288 サンプル
 
-// ブロック繋ぎ目の「ブツッ」というノイズを減らすクロスフェード長（32フレーム ≒ 約0.74秒）
+// ブロック繋ぎ目のクロスフェード長（32フレーム）
 const CROSSFADE_SAMPLES = 32 * HOP_LENGTH; // 32,768 サンプル
 const STEP_SAMPLES = Math.max(HOP_LENGTH * 16, BLOCK_SAMPLES - CROSSFADE_SAMPLES);
 
-// 4ブロックごとにセッションを解放・再生成して iOS の WASM ヒープ膨張を抑制
-const SESSION_RECYCLE_BLOCKS = 4;
+// 大容量ファイルで WASM ヒープの断片化・膨張を抑えるため 2ブロックごとにリフレッシュ
+const SESSION_RECYCLE_BLOCKS = 2;
 
 function createPeriodicHannWindow(length) {
   const win = new Float32Array(length);
@@ -151,13 +151,19 @@ function fftInPlace(re, im, dir) {
   }
 }
 
-function computeStft(samples) {
+function computeStft(samples, scratch) {
   const numFrames = Math.max(1, Math.floor((samples.length - N_FFT) / HOP_LENGTH) + 1);
-  const reOut = new Float32Array(numFrames * FREQ_BINS);
-  const imOut = new Float32Array(numFrames * FREQ_BINS);
+  const needed = numFrames * FREQ_BINS;
 
-  const frameRe = new Float32Array(N_FFT);
-  const frameIm = new Float32Array(N_FFT);
+  if (!scratch.re || scratch.re.length < needed) {
+    scratch.re = new Float32Array(needed);
+    scratch.im = new Float32Array(needed);
+  }
+
+  const reOut = scratch.re;
+  const imOut = scratch.im;
+  const frameRe = scratch.frameRe;
+  const frameIm = scratch.frameIm;
 
   for (let f = 0; f < numFrames; f++) {
     const start = f * HOP_LENGTH;
@@ -180,11 +186,19 @@ function computeStft(samples) {
   return { numFrames, re: reOut, im: imOut };
 }
 
-function computeIstft(reSpec, imSpec, numFrames, outputLength) {
-  const out = new Float32Array(outputLength);
-  const norm = new Float32Array(outputLength);
-  const frameRe = new Float32Array(N_FFT);
-  const frameIm = new Float32Array(N_FFT);
+function computeIstft(reSpec, imSpec, numFrames, outputLength, scratch) {
+  if (!scratch.out || scratch.out.length < outputLength) {
+    scratch.out = new Float32Array(outputLength);
+    scratch.norm = new Float32Array(outputLength);
+  }
+
+  const out = scratch.out;
+  const norm = scratch.norm;
+  out.fill(0, 0, outputLength);
+  norm.fill(0, 0, outputLength);
+
+  const frameRe = scratch.frameRe;
+  const frameIm = scratch.frameIm;
 
   for (let f = 0; f < numFrames; f++) {
     const base = f * FREQ_BINS;
@@ -225,7 +239,7 @@ function computeIstft(reSpec, imSpec, numFrames, outputLength) {
   return out;
 }
 
-function buildFixed512Tensor(session, leftStft, rightStft) {
+function buildFixed512Tensor(session, leftStft, rightStft, tensorScratch) {
   const inputName = session.inputNames[0];
   const meta = session.inputMetadata?.[inputName];
   const dims = meta?.dimensions || [];
@@ -237,8 +251,14 @@ function buildFixed512Tensor(session, leftStft, rightStft) {
   const freqBins =
     typeof dims[3] === "number" && dims[3] > 0 ? dims[3] : MODEL_BINS;
 
+  const totalLen = chDim * numSplits * targetFrames * freqBins;
+  if (!tensorScratch.data || tensorScratch.data.length !== totalLen) {
+    tensorScratch.data = new Float32Array(totalLen);
+  }
+  const data = tensorScratch.data;
+  data.fill(0);
+
   const totalFrames = leftStft.numFrames;
-  const data = new Float32Array(chDim * numSplits * targetFrames * freqBins);
 
   for (let c = 0; c < chDim; c++) {
     const srcRe = c === 0 ? leftStft.re : rightStft.re;
@@ -268,15 +288,21 @@ function buildFixed512Tensor(session, leftStft, rightStft) {
   };
 }
 
-function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength) {
+function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength, reconScratch, istftScratch) {
   const { numSplits, targetFrames, freqBins } = specInfo;
   const dims = outTensor.dims || [];
   const chCountInOut = dims.length >= 1 && dims[0] >= 2 ? 2 : 1;
   const outData = outTensor.data;
   const totalFrames = stftObj.numFrames;
+  const needed = totalFrames * FREQ_BINS;
 
-  const mRe = new Float32Array(stftObj.re.length);
-  const mIm = new Float32Array(stftObj.im.length);
+  if (!reconScratch.mRe || reconScratch.mRe.length < needed) {
+    reconScratch.mRe = new Float32Array(needed);
+    reconScratch.mIm = new Float32Array(needed);
+  }
+
+  const mRe = reconScratch.mRe;
+  const mIm = reconScratch.mIm;
 
   for (let f = 0; f < totalFrames; f++) {
     const sp = Math.floor(f / targetFrames);
@@ -303,7 +329,7 @@ function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength)
     }
   }
 
-  return computeIstft(mRe, mIm, totalFrames, outputLength);
+  return computeIstft(mRe, mIm, totalFrames, outputLength, istftScratch);
 }
 
 function writeBlockWithCrossfade(dstLeft, dstRight, outL, outR, start, totalLength, blockIdx, totalBlocks) {
@@ -346,13 +372,34 @@ function clampBuffer(buf) {
   }
 }
 
-function yieldForGC(ms = 90) {
+function yieldForGC(ms = 110) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 self.onmessage = async (e) => {
   let session = null;
   let modelBytes = null;
+
+  const stftScratchL = {
+    re: null,
+    im: null,
+    frameRe: new Float32Array(N_FFT),
+    frameIm: new Float32Array(N_FFT),
+  };
+  const stftScratchR = {
+    re: null,
+    im: null,
+    frameRe: new Float32Array(N_FFT),
+    frameIm: new Float32Array(N_FFT),
+  };
+  const tensorScratch = { data: null };
+  const reconScratch = { mRe: null, mIm: null };
+  const istftScratch = {
+    out: null,
+    norm: null,
+    frameRe: new Float32Array(N_FFT),
+    frameIm: new Float32Array(N_FFT),
+  };
 
   try {
     const { sampleRate, left, right } = e.data;
@@ -382,7 +429,7 @@ self.onmessage = async (e) => {
         });
         await releaseSession(session);
         session = null;
-        await yieldForGC(140);
+        await yieldForGC(150);
         session = await createSessionFromBytes(modelBytes);
       }
 
@@ -400,10 +447,10 @@ self.onmessage = async (e) => {
       const leftSlice = left.subarray(start, end);
       const rightSlice = right.subarray(start, end);
 
-      let leftStft = computeStft(leftSlice);
-      let rightStft = computeStft(rightSlice);
+      const leftStft = computeStft(leftSlice, stftScratchL);
+      const rightStft = computeStft(rightSlice, stftScratchR);
 
-      let built = buildFixed512Tensor(session, leftStft, rightStft);
+      let built = buildFixed512Tensor(session, leftStft, rightStft, tensorScratch);
       let results = await session.run({ [inputName]: built.tensor });
       const outTensor = results[outputName];
 
@@ -412,15 +459,29 @@ self.onmessage = async (e) => {
         throw new Error(`出力 "${outputName}" が取得できませんでした。`);
       }
 
-      const outL = reconChannelFixed512(leftStft, 0, outTensor, built, leftSlice.length);
-      const outR = reconChannelFixed512(rightStft, 1, outTensor, built, rightSlice.length);
+      const outL = reconChannelFixed512(
+        leftStft,
+        0,
+        outTensor,
+        built,
+        leftSlice.length,
+        reconScratch,
+        istftScratch
+      );
+      const outR = reconChannelFixed512(
+        rightStft,
+        1,
+        outTensor,
+        built,
+        rightSlice.length,
+        reconScratch,
+        istftScratch
+      );
 
       built.tensor.dispose();
       outTensor.dispose();
       built = null;
       results = null;
-      leftStft = null;
-      rightStft = null;
 
       writeBlockWithCrossfade(
         dstLeft,
@@ -434,13 +495,23 @@ self.onmessage = async (e) => {
       );
 
       if (blockIdx < totalBlocks - 1) {
-        await yieldForGC(90);
+        await yieldForGC(110);
       }
     }
 
     await releaseSession(session);
     session = null;
     modelBytes = null;
+
+    stftScratchL.re = null;
+    stftScratchL.im = null;
+    stftScratchR.re = null;
+    stftScratchR.im = null;
+    tensorScratch.data = null;
+    reconScratch.mRe = null;
+    reconScratch.mIm = null;
+    istftScratch.out = null;
+    istftScratch.norm = null;
 
     clampBuffer(dstLeft);
     clampBuffer(dstRight);
