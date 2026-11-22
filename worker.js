@@ -1,18 +1,13 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
 
-// iOS Safari でのクラッシュ・メモリ膨張を防ぐための必須設定
+// iOS Safari でのクラッシュ・メモリ膨張を防ぐ設定
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 
-const MODEL_URLS = {
-  vocals:
-    "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/vocals.onnx?download=true",
-  accompaniment:
-    "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/accompaniment.onnx?download=true",
-};
+const ACCOMPANIMENT_MODEL_URL =
+  "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/accompaniment.onnx?download=true";
 
-const MODEL_CACHE_NAME = "wing-spleeter-onnx-cache-v1";
-const STEM_KEYS = ["vocals", "accompaniment"];
+const MODEL_CACHE_NAME = "wing-spleeter-accompaniment-cache-v1";
 
 // Spleeter 44.1kHz 標準 STFT パラメータ
 const N_FFT = 4096;
@@ -20,7 +15,7 @@ const HOP_LENGTH = 1024;
 const FREQ_BINS = N_FFT / 2 + 1; // 2049
 const MODEL_BINS = 1024;
 
-// iPhone向けにチャンクをさらに小さく設定（3秒チャンク + 0.3秒オーバーラップ）
+// iPhone向け省メモリチャンク設定（3秒チャンク + 0.3秒オーバーラップ）
 const CHUNK_SAMPLES = 44100 * 3;
 const OVERLAP_SAMPLES = Math.floor(44100 * 0.3);
 
@@ -34,65 +29,62 @@ function createPeriodicHannWindow(length) {
 
 const HANN_WINDOW = createPeriodicHannWindow(N_FFT);
 
-async function loadModelArrayBuffer(stemKey, url) {
+async function loadAccompanimentModelBuffer() {
   const cacheSupported = typeof caches !== "undefined";
 
   if (cacheSupported) {
     const cache = await caches.open(MODEL_CACHE_NAME);
-    const cachedResponse = await cache.match(url);
+    const cachedResponse = await cache.match(ACCOMPANIMENT_MODEL_URL);
     if (cachedResponse && cachedResponse.ok) {
       postMessage({
         type: "progress",
-        message: `[${stemKey}] キャッシュからモデル読込中...`,
+        message: "キャッシュから伴奏モデルを読込中...",
       });
       return await cachedResponse.arrayBuffer();
     }
 
     postMessage({
       type: "progress",
-      message: `[${stemKey}] モデルをダウンロード＆保存中...`,
+      message: "伴奏モデルを初回ダウンロード＆保存中...",
     });
 
-    const response = await fetch(url);
+    const response = await fetch(ACCOMPANIMENT_MODEL_URL);
     if (!response.ok) {
-      throw new Error(`${stemKey} モデルの取得に失敗しました (HTTP ${response.status})`);
+      throw new Error(`伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
     }
 
-    await cache.put(url, response.clone());
+    await cache.put(ACCOMPANIMENT_MODEL_URL, response.clone());
     return await response.arrayBuffer();
   }
 
   postMessage({
     type: "progress",
-    message: `[${stemKey}] モデルをダウンロード中...`,
+    message: "伴奏モデルをダウンロード中...",
   });
 
-  const response = await fetch(url);
+  const response = await fetch(ACCOMPANIMENT_MODEL_URL);
   if (!response.ok) {
-    throw new Error(`${stemKey} モデルの取得に失敗しました (HTTP ${response.status})`);
+    throw new Error(`伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
   }
   return await response.arrayBuffer();
 }
 
-async function createSingleSession(stemKey) {
-  const url = MODEL_URLS[stemKey];
-  let modelBuffer = await loadModelArrayBuffer(stemKey, url);
+async function createAccompanimentSession() {
+  let modelBuffer = await loadAccompanimentModelBuffer();
 
   postMessage({
     type: "progress",
-    message: `[${stemKey}] AIセッションを展開中 (省メモリモード)...`,
+    message: "AIセッションを展開中 (省メモリモード)...",
   });
 
   const modelBytes = new Uint8Array(modelBuffer);
-  modelBuffer = null; // 参照を早めに解放
+  modelBuffer = null;
 
-  const session = await ort.InferenceSession.create(modelBytes, {
+  return await ort.InferenceSession.create(modelBytes, {
     executionProviders: ["wasm"],
     enableMemPattern: false,
     enableCpuMemArena: false,
   });
-
-  return session;
 }
 
 async function releaseSession(session) {
@@ -316,15 +308,27 @@ function reconChannelWithTensor(stftObj, chIdx, outTensor, metaInfo, outputLengt
   return computeIstft(mRe, mIm, totalFrames, outputLength);
 }
 
-async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
-  const totalLength = left.length;
-  const step = Math.max(1, CHUNK_SAMPLES - OVERLAP_SAMPLES);
-  const totalChunks = Math.max(1, Math.ceil(totalLength / step));
+function clampBuffer(buf) {
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] > 1) buf[i] = 1;
+    else if (buf[i] < -1) buf[i] = -1;
+  }
+}
 
+self.onmessage = async (e) => {
   let session = null;
 
   try {
-    session = await createSingleSession(stemKey);
+    const { sampleRate, left, right } = e.data;
+    const totalLength = left.length;
+
+    const dstLeft = new Float32Array(totalLength);
+    const dstRight = new Float32Array(totalLength);
+
+    const step = Math.max(1, CHUNK_SAMPLES - OVERLAP_SAMPLES);
+    const totalChunks = Math.max(1, Math.ceil(totalLength / step));
+
+    session = await createAccompanimentSession();
     const inputName = session.inputNames[0];
     const outputName = session.outputNames[0];
 
@@ -337,7 +341,7 @@ async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
 
       postMessage({
         type: "progress",
-        message: `[${stemKey}] 分離計算中... ${pct}% (${chunkIdx + 1}/${totalChunks})`,
+        message: `伴奏を抽出中... ${pct}% (${chunkIdx + 1}/${totalChunks})`,
       });
 
       const leftSlice = left.subarray(start, end);
@@ -352,7 +356,7 @@ async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
 
       if (!outTensor) {
         built.tensor.dispose();
-        throw new Error(`出力 "${outputName}" (${stemKey}) が取得できませんでした。`);
+        throw new Error(`出力 "${outputName}" が取得できませんでした。`);
       }
 
       const outL = reconChannelWithTensor(leftStft, 0, outTensor, built, leftSlice.length);
@@ -379,67 +383,31 @@ async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
         }
       }
     }
-  } finally {
+
     await releaseSession(session);
     session = null;
-  }
-}
 
-function clampBuffer(buf) {
-  for (let i = 0; i < buf.length; i++) {
-    if (buf[i] > 1) buf[i] = 1;
-    else if (buf[i] < -1) buf[i] = -1;
-  }
-}
-
-self.onmessage = async (e) => {
-  try {
-    const { sampleRate, left, right } = e.data;
-    const totalLength = left.length;
-
-    const finalStems = {
-      vocals: {
-        left: new Float32Array(totalLength),
-        right: new Float32Array(totalLength),
-      },
-      accompaniment: {
-        left: new Float32Array(totalLength),
-        right: new Float32Array(totalLength),
-      },
-    };
-
-    for (let i = 0; i < STEM_KEYS.length; i++) {
-      const key = STEM_KEYS[i];
-      await processSingleStem(
-        key,
-        left,
-        right,
-        finalStems[key].left,
-        finalStems[key].right
-      );
-      clampBuffer(finalStems[key].left);
-      clampBuffer(finalStems[key].right);
-    }
+    clampBuffer(dstLeft);
+    clampBuffer(dstRight);
 
     postMessage({
       type: "progress",
-      message: "2 パート分のWAVデータを転送中...",
+      message: "伴奏WAVデータを転送中...",
     });
-
-    const transferBuffers = [];
-    for (const key of STEM_KEYS) {
-      transferBuffers.push(finalStems[key].left.buffer, finalStems[key].right.buffer);
-    }
 
     postMessage(
       {
         type: "done",
         sampleRate,
-        stems: finalStems,
+        accompaniment: {
+          left: dstLeft,
+          right: dstRight,
+        },
       },
-      transferBuffers
+      [dstLeft.buffer, dstRight.buffer]
     );
   } catch (err) {
+    await releaseSession(session);
     postMessage({
       type: "error",
       message: err?.message || String(err),
