@@ -1,14 +1,11 @@
-const APP_VERSION = "Ver.1.14";
+const APP_VERSION = "Ver.1.13";
 const TARGET_SAMPLE_RATE = 44100;
 
-// クラッシュを抑えるための出力設定・区間上限
+// iOSのメモリピークを抑える軽量出力設定
 const OUTPUT_SAMPLE_RATE = 22050;
 const OUTPUT_CHANNELS = 1;
-const DEFAULT_START_SEC = 0;
-const DEFAULT_DURATION_SEC = 45;
-const MAX_SLICE_SEC = 120;
 
-// ダウンロード処理開始時に不要なバックグラウンド/ページ参照を解放
+// 1段階目のダウンロード処理開始時に不要なバックグラウンド／ページ参照を解放
 const RELEASE_BACKGROUND_ON_DOWNLOAD = true;
 
 const fileInput = document.getElementById("audioFile");
@@ -17,15 +14,8 @@ const runBtn = document.getElementById("runBtn");
 const statusEl = document.getElementById("status");
 const dlBtn = document.getElementById("dl-accompaniment");
 const autoSaveToggle = document.getElementById("autoSaveToggle");
-const startSecInput = document.getElementById("startSecInput");
-const durationSecInput = document.getElementById("durationSecInput");
-const mergeFilesInput = document.getElementById("mergeFilesInput");
-const mergePickSub = document.getElementById("mergePickSub");
-const mergeFileList = document.getElementById("mergeFileList");
-const mergeBtn = document.getElementById("mergeBtn");
 
 let selectedFile = null;
-let selectedMergeFiles = [];
 let currentAudioBlob = null;
 let currentBlobUrl = null;
 let currentFileName = "accompaniment.wav";
@@ -46,74 +36,8 @@ if (autoSaveToggle) {
     autoSaveEnabled = !autoSaveEnabled;
     updateAutoSaveUi();
     statusEl.textContent = autoSaveEnabled
-      ? "自動保存を ON にしました(完了時に保存を試行します)。"
-      : "自動保存を OFF にしました(完了後に「音声 保存」を押してください)。";
-  });
-}
-
-function getSliceRangeSec() {
-  const rawStart = Number(startSecInput?.value ?? DEFAULT_START_SEC);
-  const rawDur = Number(durationSecInput?.value ?? DEFAULT_DURATION_SEC);
-  const startSec =
-    Number.isFinite(rawStart) && rawStart >= 0
-      ? Math.floor(rawStart)
-      : DEFAULT_START_SEC;
-  let durationSec =
-    Number.isFinite(rawDur) && rawDur > 0
-      ? Math.floor(rawDur)
-      : DEFAULT_DURATION_SEC;
-
-  if (durationSec > MAX_SLICE_SEC) {
-    durationSec = MAX_SLICE_SEC;
-    if (durationSecInput) durationSecInput.value = String(MAX_SLICE_SEC);
-  }
-  return { startSec, durationSec };
-}
-
-function buildAutoSegments(totalDurationSec, startSec, stepDurationSec) {
-  const segments = [];
-  if (totalDurationSec <= 0) return segments;
-  let curStart = Math.min(startSec, Math.max(0, totalDurationSec - 0.1));
-  while (curStart < totalDurationSec - 0.05) {
-    const curEnd = Math.min(totalDurationSec, curStart + stepDurationSec);
-    const actualLen = curEnd - curStart;
-    if (actualLen >= 0.05) {
-      segments.push({
-        startSec: curStart,
-        endSec: curEnd,
-        labelStart: Math.floor(curStart),
-        labelEnd: Math.ceil(curEnd),
-      });
-    }
-    curStart = curEnd;
-  }
-  return segments;
-}
-
-function extractStartSecFromName(fileName) {
-  const match = fileName.match(/(?:^|[\s_-])(\d+)-(\d+)s/i);
-  if (match) {
-    return Number(match[1]);
-  }
-  return Number.MAX_SAFE_INTEGER;
-}
-
-function sortMergeFiles(files) {
-  return [...files].sort((a, b) => {
-    const startA = extractStartSecFromName(a.name);
-    const startB = extractStartSecFromName(b.name);
-    if (startA !== startB) return startA - startB;
-    return a.name.localeCompare(b.name, "ja");
-  });
-}
-
-function renderMergeFileList(files) {
-  if (!mergeFileList) return;
-  mergeFileList.innerHTML = "";
-  files.forEach((f, idx) => {
-    const li = document.createElement("li");
-    li.textContent = `${idx + 1}. ${f.name} (${(f.size / 1024).toFixed(1)} KB)`;
-    mergeFileList.appendChild(li);
+      ? "自動保存を ON にしました（抽出完了時に保存を試行します）。"
+      : "自動保存を OFF にしました（完了後に「音声 保存」を押してください）。";
   });
 }
 
@@ -131,19 +55,19 @@ function isAllowedAudio(file) {
     "audio/wav",
     "audio/wave",
     "audio/x-wav",
-  ].includes((file.type || "").toLowerCase());
+  ].includes(file.type.toLowerCase());
   return nameOk || typeOk;
 }
 
-function clearGeneratedAudio({ keepUrlBriefly = false, keepInputFile = false } = {}) {
+function clearGeneratedAudio({ keepUrlBriefly = false } = {}) {
   if (currentBlobUrl && !keepUrlBriefly) {
     try {
       URL.revokeObjectURL(currentBlobUrl);
     } catch (_) {}
-    currentBlobUrl = null;
   }
+  currentBlobUrl = null;
   currentAudioBlob = null;
-  if (!keepInputFile && dlBtn) {
+  if (dlBtn) {
     dlBtn.disabled = true;
   }
 }
@@ -157,20 +81,23 @@ function terminateWorkerSafely() {
   }
 }
 
-function releaseSegmentMemoryAfterSave(urlToKeepBriefly = null, isFinalSegment = false) {
+/**
+ * 1段階目のダウンロード要求が押された／走ったタイミングで
+ * バックグラウンドワーカーや不要な参照を解放する
+ */
+function releaseBackgroundMemoryOnDownload(urlToKeepBriefly = null) {
   terminateWorkerSafely();
+  selectedFile = null;
   currentAudioBlob = null;
 
-  if (isFinalSegment) {
-    selectedFile = null;
-    if (fileInput) {
-      try {
-        fileInput.value = "";
-      } catch (_) {}
-    }
-    if (dlBtn) {
-      dlBtn.disabled = true;
-    }
+  if (fileInput) {
+    try {
+      fileInput.value = "";
+    } catch (_) {}
+  }
+
+  if (dlBtn) {
+    dlBtn.disabled = true;
   }
 
   if (urlToKeepBriefly) {
@@ -181,7 +108,7 @@ function releaseSegmentMemoryAfterSave(urlToKeepBriefly = null, isFinalSegment =
       if (currentBlobUrl === urlToKeepBriefly) {
         currentBlobUrl = null;
       }
-    }, 15000);
+    }, 20000);
   } else if (currentBlobUrl) {
     const oldUrl = currentBlobUrl;
     currentBlobUrl = null;
@@ -189,77 +116,42 @@ function releaseSegmentMemoryAfterSave(urlToKeepBriefly = null, isFinalSegment =
       try {
         URL.revokeObjectURL(oldUrl);
       } catch (_) {}
-    }, 15000);
+    }, 20000);
   }
 }
 
-function yieldTick(ms = 30) {
+function yieldTick(ms = 25) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function decodeFileToMonoResampled(file, targetRate) {
-  let arrayBuffer = await file.arrayBuffer();
-  const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-  const audioCtx = new AudioContextClass();
-  let decodedBuffer = null;
-  try {
-    decodedBuffer = await audioCtx.decodeAudioData(arrayBuffer);
-  } finally {
-    arrayBuffer = null;
-    if (typeof audioCtx.close === "function") {
-      await audioCtx.close().catch(() => {});
-    }
-  }
-
-  const length = Math.max(1, Math.ceil(decodedBuffer.duration * targetRate));
-  const offlineCtx = new OfflineAudioContext(1, length, targetRate);
-  const src = offlineCtx.createBufferSource();
-  src.buffer = decodedBuffer;
-  src.connect(offlineCtx.destination);
-  src.start(0);
-  const rendered = await offlineCtx.startRendering();
-  src.disconnect();
-  decodedBuffer = null;
-  return new Float32Array(rendered.getChannelData(0));
-}
-
-async function extractNormalizedSlice(decodedBuffer, startSec, endSec) {
+async function normalizeTo44100Stereo(decodedBuffer) {
   const numChannels = decodedBuffer.numberOfChannels;
   if (numChannels < 1) {
     throw new Error("有効な音声チャンネルが見つかりませんでした。");
   }
 
-  const totalDuration = decodedBuffer.duration;
-  const safeStart = Math.min(startSec, Math.max(0, totalDuration - 0.05));
-  const safeEnd = Math.min(totalDuration, Math.max(safeStart + 0.05, endSec));
-  const actualDur = safeEnd - safeStart;
-  const targetLength = Math.max(1, Math.ceil(actualDur * TARGET_SAMPLE_RATE));
+  const needsResample = decodedBuffer.sampleRate !== TARGET_SAMPLE_RATE;
+  const needsChannelConvert = numChannels !== 2;
 
+  if (!needsResample && !needsChannelConvert) {
+    return decodedBuffer;
+  }
+
+  const targetLength = Math.ceil(decodedBuffer.duration * TARGET_SAMPLE_RATE);
   const offlineCtx = new OfflineAudioContext(2, targetLength, TARGET_SAMPLE_RATE);
-  const srcStartSample = Math.min(
-    decodedBuffer.length,
-    Math.max(0, Math.floor(safeStart * decodedBuffer.sampleRate))
-  );
-  const srcEndSample = Math.min(
-    decodedBuffer.length,
-    Math.max(srcStartSample + 1, Math.ceil(safeEnd * decodedBuffer.sampleRate))
-  );
-  const sliceLen = srcEndSample - srcStartSample;
-
   const inputForRender = offlineCtx.createBuffer(
     Math.min(numChannels, 2),
-    sliceLen,
+    decodedBuffer.length,
     decodedBuffer.sampleRate
   );
 
-  for (let c = 0; c < Math.min(numChannels, 2); c++) {
-    const fullCh = decodedBuffer.getChannelData(c);
-    inputForRender.copyToChannel(fullCh.subarray(srcStartSample, srcEndSample), c);
-  }
-
   if (numChannels === 1) {
-    const monoSlice = inputForRender.getChannelData(0);
-    inputForRender.copyToChannel(monoSlice, 1);
+    const mono = decodedBuffer.getChannelData(0);
+    inputForRender.copyToChannel(mono, 0);
+    inputForRender.copyToChannel(mono, 1);
+  } else {
+    inputForRender.copyToChannel(decodedBuffer.getChannelData(0), 0);
+    inputForRender.copyToChannel(decodedBuffer.getChannelData(1), 1);
   }
 
   const source = offlineCtx.createBufferSource();
@@ -268,12 +160,7 @@ async function extractNormalizedSlice(decodedBuffer, startSec, endSec) {
   source.start(0);
   const rendered = await offlineCtx.startRendering();
   source.disconnect();
-
-  return {
-    left: new Float32Array(rendered.getChannelData(0)),
-    right: new Float32Array(rendered.getChannelData(1)),
-    sampleRate: rendered.sampleRate,
-  };
+  return rendered;
 }
 
 function buildOutputSamples(chL, chR, srcRate, dstRate, outChannels) {
@@ -287,6 +174,7 @@ function buildOutputSamples(chL, chR, srcRate, dstRate, outChannels) {
       const idx0 = Math.floor(srcPos);
       const idx1 = Math.min(chL.length - 1, idx0 + 1);
       const frac = srcPos - idx0;
+
       const sL = chL[idx0] * (1 - frac) + chL[idx1] * frac;
       const sR = chR[idx0] * (1 - frac) + chR[idx1] * frac;
       outMono[i] = 0.5 * (sL + sR);
@@ -301,13 +189,14 @@ function buildOutputSamples(chL, chR, srcRate, dstRate, outChannels) {
     const idx0 = Math.floor(srcPos);
     const idx1 = Math.min(chL.length - 1, idx0 + 1);
     const frac = srcPos - idx0;
+
     outL[i] = chL[idx0] * (1 - frac) + chL[idx1] * frac;
     outR[i] = chR[idx0] * (1 - frac) + chR[idx1] * frac;
   }
   return { channels: [outL, outR], rate: dstRate };
 }
 
-async function triggerDownloadOrShare({ isAuto = false, isFinalSegment = false } = {}) {
+async function triggerDownloadOrShare({ isAuto = false } = {}) {
   if (!currentAudioBlob || currentAudioBlob.size <= 44) {
     statusEl.textContent = "保存できる音声データがありません。";
     return false;
@@ -318,27 +207,33 @@ async function triggerDownloadOrShare({ isAuto = false, isFinalSegment = false }
       const wavFile = new File([currentAudioBlob], currentFileName, {
         type: "audio/wav",
       });
-      if (
-        typeof navigator.canShare !== "function" ||
-        navigator.canShare({ files: [wavFile] })
-      ) {
+      if (typeof navigator.canShare !== "function" || navigator.canShare({ files: [wavFile] })) {
+        if (RELEASE_BACKGROUND_ON_DOWNLOAD) {
+          terminateWorkerSafely();
+          selectedFile = null;
+          if (fileInput) {
+            try {
+              fileInput.value = "";
+            } catch (_) {}
+          }
+        }
         await navigator.share({
           files: [wavFile],
           title: currentFileName,
         });
         statusEl.textContent = `共有メニューを開きました: ${currentFileName}`;
         if (RELEASE_BACKGROUND_ON_DOWNLOAD) {
-          releaseSegmentMemoryAfterSave(null, isFinalSegment);
+          clearGeneratedAudio();
         }
         return true;
       }
     } catch (shareErr) {
       if (shareErr?.name === "AbortError") {
-        statusEl.textContent = `保存をキャンセルしました: ${currentFileName} (「音声 保存」から再試行できます)`;
+        statusEl.textContent = "保存をキャンセルしました。「音声 保存」から再試行できます。";
         return false;
       }
       if (isAuto) {
-        statusEl.textContent = `自動共有はブロックされました: ${currentFileName} (「音声 保存」を押してください)`;
+        statusEl.textContent = "自動共有はブロックされました。「音声 保存」を押して保存してください。";
         return false;
       }
     }
@@ -347,6 +242,7 @@ async function triggerDownloadOrShare({ isAuto = false, isFinalSegment = false }
   try {
     const urlToUse = currentBlobUrl || URL.createObjectURL(currentAudioBlob);
     currentBlobUrl = urlToUse;
+
     const tempLink = document.createElement("a");
     tempLink.href = urlToUse;
     tempLink.download = currentFileName;
@@ -357,297 +253,159 @@ async function triggerDownloadOrShare({ isAuto = false, isFinalSegment = false }
     document.body.removeChild(tempLink);
 
     statusEl.textContent = isAuto
-      ? `ダウンロード要求を送信しました: ${currentFileName}`
+      ? `ダウンロード要求を送信しました: ${currentFileName}（ポップアップの「ダウンロード」を押してください）`
       : `ダウンロード要求を送信しました: ${currentFileName}`;
 
     if (RELEASE_BACKGROUND_ON_DOWNLOAD) {
-      releaseSegmentMemoryAfterSave(urlToUse, isFinalSegment);
+      releaseBackgroundMemoryOnDownload(urlToUse);
     }
+
     return true;
   } catch (err) {
     statusEl.textContent = isAuto
-      ? `自動保存がブロックされました: ${currentFileName} (「音声 保存」を押してください)`
+      ? "自動保存がブロックされました。「音声 保存」を押して保存してください。"
       : `ダウンロードエラー: ${err.message}`;
     return false;
   }
 }
 
-function runWorkerForSegment(sampleRate, left, right, segIndex, totalSegments, segLabel) {
-  return new Promise((resolve, reject) => {
-    terminateWorkerSafely();
+function attachWorkerHandlers(w) {
+  w.onmessage = async (e) => {
+    const { type, message, accompaniment, sampleRate } = e.data;
 
-    // iOS Safari でのパス解決・キャッシュ不整合を防ぐため絶対URLを指定
-    const workerUrl = new URL("./worker.js?v=1.14-fp16-merge", window.location.href);
-    let w;
-    try {
-      w = new Worker(workerUrl.href, { type: "module" });
-    } catch (initErr) {
-      reject(new Error(`Worker起動失敗: ${initErr?.message || initErr}`));
-      return;
-    }
-    worker = w;
+    if (type === "progress") {
+      statusEl.textContent = message;
+    } else if (type === "done") {
+      terminateWorkerSafely();
+      statusEl.textContent = "ステップ3/3: 音声ファイルを生成中...";
 
-    w.onmessage = (e) => {
-      const { type, message, accompaniment, sampleRate: outRate } = e.data || {};
-      if (type === "progress") {
-        statusEl.textContent = `[区間 ${segIndex + 1}/${totalSegments} (${segLabel})] ${message}`;
-      } else if (type === "done") {
-        terminateWorkerSafely();
-        resolve({
-          left: accompaniment?.left || new Float32Array(0),
-          right: accompaniment?.right || new Float32Array(0),
-          sampleRate: outRate || sampleRate,
-        });
-      } else if (type === "error") {
-        terminateWorkerSafely();
-        reject(new Error(message || "区間分離中にエラーが発生しました。"));
+      try {
+        await yieldTick(30);
+
+        if (accompaniment) {
+          let chL = accompaniment.left;
+          let chR = accompaniment.right;
+          accompaniment.left = null;
+          accompaniment.right = null;
+
+          const builtOut = buildOutputSamples(
+            chL,
+            chR,
+            sampleRate || TARGET_SAMPLE_RATE,
+            OUTPUT_SAMPLE_RATE,
+            OUTPUT_CHANNELS
+          );
+          chL = null;
+          chR = null;
+
+          currentAudioBlob = await encodeWavBlobChunked(
+            builtOut.channels,
+            builtOut.rate
+          );
+          builtOut.channels = null;
+
+          if (dlBtn) {
+            dlBtn.disabled = false;
+          }
+        }
+
+        if (autoSaveEnabled && dlBtn && !dlBtn.disabled) {
+          await triggerDownloadOrShare({ isAuto: true });
+        } else {
+          statusEl.textContent = "完了! 「音声 保存」を押して保存してください。";
+        }
+      } catch (err) {
+        statusEl.textContent = `音声生成エラー: ${err.message}`;
+      } finally {
+        runBtn.disabled = false;
       }
-    };
-
-    w.onerror = (err) => {
+    } else if (type === "error") {
       terminateWorkerSafely();
-      // iPhone で err.message が空になる場合でも原因を特定できるように詳細を出力
-      const detail =
-        err?.message ||
-        `type=${err?.type || "error"}, file=${err?.filename || "worker.js"}, line=${err?.lineno ?? "?"}`;
-      reject(new Error(`ワーカーエラー: ${detail}`));
-    };
+      statusEl.textContent = `分離エラー: ${message || "処理中にエラーが発生しました。"}`;
+      runBtn.disabled = false;
+    }
+  };
 
-    w.onmessageerror = () => {
-      terminateWorkerSafely();
-      reject(new Error("ワーカーとのデータ通信エラーが発生しました。"));
-    };
-
-    w.postMessage(
-      {
-        sampleRate,
-        left,
-        right,
-      },
-      [left.buffer, right.buffer]
-    );
-  });
+  w.onerror = (err) => {
+    terminateWorkerSafely();
+    statusEl.textContent = `ワーカーエラー: ${err.message || "予期しないエラーが発生しました。"}`;
+    runBtn.disabled = false;
+  };
 }
 
 fileInput.addEventListener("change", (e) => {
   const file = e.target.files?.[0];
   clearGeneratedAudio();
+
   if (!isAllowedAudio(file)) {
     selectedFile = null;
     runBtn.disabled = true;
-    fileSub.textContent = "対応形式: MP3 / WAV (曲終了まで自動分割)";
-    statusEl.textContent = "エラー: MP3 または WAV ファイルのみ対応しています。";
+    fileSub.textContent = "対応形式: MP3 / WAV (44100Hz・ステレオへ自動変換)";
+    statusEl.textContent = "エラー: MP3 または WAVファイルのみ対応しています。";
     return;
   }
 
   selectedFile = file;
   const baseName = file.name.replace(/\.[^.]+$/, "") || "accompaniment";
-  const { startSec, durationSec } = getSliceRangeSec();
-  currentFileName = `${baseName}_${startSec}-${startSec + durationSec}s_accompaniment.wav`;
-  runBtn.disabled = false;
+  currentFileName = `${baseName}_accompaniment.wav`;
 
+  runBtn.disabled = false;
   const mb = (file.size / 1024 / 1024).toFixed(2);
   fileSub.textContent = `${file.name} (${mb} MB)`;
-  statusEl.textContent = `選択完了: ${file.name} (${APP_VERSION}) 「伴奏抽出を実行!」を押してください。`;
+  statusEl.textContent = `選択完了: ${file.name} (${APP_VERSION}) - 「伴奏抽出を実行！」を押してください。`;
 });
 
 runBtn.addEventListener("click", async () => {
   if (!selectedFile) return;
   runBtn.disabled = true;
-  if (mergeBtn) mergeBtn.disabled = true;
   clearGeneratedAudio();
   terminateWorkerSafely();
-
-  const fileRef = selectedFile;
-  const baseName = fileRef.name.replace(/\.[^.]+$/, "") || "accompaniment";
-  const { startSec, durationSec } = getSliceRangeSec();
-
-  statusEl.textContent = "ステップ 1/3: 音源ファイルをデコード中...";
-  let audioBuffer = null;
+  statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
-    let arrayBuffer = await fileRef.arrayBuffer();
+    const arrayBuffer = await selectedFile.arrayBuffer();
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioCtx = new AudioContextClass();
+    let audioBuffer;
+
     try {
       audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
     } finally {
-      arrayBuffer = null;
       if (typeof audioCtx.close === "function") {
         await audioCtx.close().catch(() => {});
       }
     }
 
-    const segments = buildAutoSegments(audioBuffer.duration, startSec, durationSec);
-    if (segments.length === 0) {
-      throw new Error("指定された開始位置が音源の長さを超えています。");
+    const needsConvert =
+      audioBuffer.sampleRate !== TARGET_SAMPLE_RATE ||
+      audioBuffer.numberOfChannels !== 2;
+
+    if (needsConvert) {
+      statusEl.textContent = `ステップ1/3: 44100Hz・ステレオに変換中... (元: ${audioBuffer.sampleRate}Hz / ${audioBuffer.numberOfChannels}ch)`;
     }
 
-    for (let i = 0; i < segments.length; i++) {
-      const seg = segments[i];
-      const segLabel = `${seg.labelStart}-${seg.labelEnd}s`;
-      const isFinalSegment = i === segments.length - 1;
+    const normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
+    const left = new Float32Array(normalizedBuffer.getChannelData(0));
+    const right = new Float32Array(normalizedBuffer.getChannelData(1));
 
-      statusEl.textContent = `[区間 ${i + 1}/${segments.length} (${segLabel})] 音声を切り出し中...`;
-      let sliced = await extractNormalizedSlice(audioBuffer, seg.startSec, seg.endSec);
+    worker = new Worker("worker.js?v=1.13", { type: "module" });
+    attachWorkerHandlers(worker);
 
-      let sepResult = await runWorkerForSegment(
-        sliced.sampleRate,
-        sliced.left,
-        sliced.right,
-        i,
-        segments.length,
-        segLabel
-      );
-      sliced.left = null;
-      sliced.right = null;
-      sliced = null;
-
-      statusEl.textContent = `[区間 ${i + 1}/${segments.length} (${segLabel})] 音声ファイルを生成中...`;
-      await yieldTick(25);
-
-      let chL = sepResult.left;
-      let chR = sepResult.right;
-      const outRate = sepResult.sampleRate;
-      sepResult = null;
-
-      const builtOut = buildOutputSamples(
-        chL,
-        chR,
-        outRate,
-        OUTPUT_SAMPLE_RATE,
-        OUTPUT_CHANNELS
-      );
-      chL = null;
-      chR = null;
-
-      currentAudioBlob = await encodeWavBlobChunked(
-        builtOut.channels,
-        builtOut.rate
-      );
-      builtOut.channels = null;
-
-      currentFileName = `${baseName}_${seg.labelStart}-${seg.labelEnd}s_accompaniment.wav`;
-      if (dlBtn) {
-        dlBtn.disabled = false;
-      }
-
-      if (autoSaveEnabled) {
-        await triggerDownloadOrShare({ isAuto: true, isFinalSegment });
-      } else {
-        statusEl.textContent = isFinalSegment
-          ? `完了 (${segLabel})! 「音声 保存」を押して保存してください。`
-          : `区間 ${i + 1}/${segments.length} (${segLabel}) 完了! 「音声 保存」を押してから次の区間へ進みます...`;
-      }
-
-      if (!isFinalSegment) {
-        await yieldTick(80);
-      }
-    }
-
-    audioBuffer = null;
-    if (!autoSaveEnabled) {
-      statusEl.textContent = `全 ${segments.length} 区間の抽出が完了しました!`;
-    }
+    statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
+    worker.postMessage(
+      {
+        sampleRate: normalizedBuffer.sampleRate,
+        left,
+        right,
+      },
+      [left.buffer, right.buffer]
+    );
   } catch (err) {
-    audioBuffer = null;
     terminateWorkerSafely();
-    statusEl.textContent = `処理エラー: ${err.message}`;
-  } finally {
-    audioBuffer = null;
-    runBtn.disabled = !selectedFile;
-    if (mergeBtn) mergeBtn.disabled = selectedMergeFiles.length < 2;
+    statusEl.textContent = `読み込み・変換エラー: ${err.message}`;
+    runBtn.disabled = false;
   }
 });
-
-if (mergeFilesInput) {
-  mergeFilesInput.addEventListener("change", (e) => {
-    const rawFiles = Array.from(e.target.files || []).filter(isAllowedAudio);
-    clearGeneratedAudio();
-
-    if (rawFiles.length < 2) {
-      selectedMergeFiles = [];
-      renderMergeFileList([]);
-      if (mergePickSub) {
-        mergePickSub.textContent =
-          "0-45s / 45-90s などのファイルをまとめて選択(秒数順に自動整列)";
-      }
-      if (mergeBtn) mergeBtn.disabled = true;
-      statusEl.textContent =
-        "統合するには細切れファイルを2つ以上選択してください。";
-      return;
-    }
-
-    selectedMergeFiles = sortMergeFiles(rawFiles);
-    renderMergeFileList(selectedMergeFiles);
-    if (mergePickSub) {
-      mergePickSub.textContent = `${selectedMergeFiles.length} 個のファイルをロード済み`;
-    }
-    if (mergeBtn) mergeBtn.disabled = false;
-    statusEl.textContent = `${selectedMergeFiles.length} 個の細切れファイルを読み込みました。「選択したファイルを1つに統合!」を押してください。`;
-  });
-}
-
-if (mergeBtn) {
-  mergeBtn.addEventListener("click", async () => {
-    if (selectedMergeFiles.length < 2) return;
-    mergeBtn.disabled = true;
-    runBtn.disabled = true;
-    clearGeneratedAudio();
-    terminateWorkerSafely();
-
-    const partsMono = [];
-    try {
-      let totalSamples = 0;
-      for (let i = 0; i < selectedMergeFiles.length; i++) {
-        const f = selectedMergeFiles[i];
-        statusEl.textContent = `統合準備中 (${i + 1}/${selectedMergeFiles.length}): ${f.name} をデコード中...`;
-        const monoSamples = await decodeFileToMonoResampled(f, OUTPUT_SAMPLE_RATE);
-        partsMono.push(monoSamples);
-        totalSamples += monoSamples.length;
-        await yieldTick(25);
-      }
-
-      statusEl.textContent = "細切れデータを1本の音声に結合中...";
-      await yieldTick(25);
-
-      let mergedMono = new Float32Array(Math.max(1, totalSamples));
-      let writePos = 0;
-      for (let i = 0; i < partsMono.length; i++) {
-        const seg = partsMono[i];
-        mergedMono.set(seg, writePos);
-        writePos += seg.length;
-        partsMono[i] = null;
-      }
-      partsMono.length = 0;
-
-      statusEl.textContent = "統合 WAVファイルを生成中...";
-      currentAudioBlob = await encodeWavBlobChunked([mergedMono], OUTPUT_SAMPLE_RATE);
-      mergedMono = null;
-
-      const firstNameBase =
-        selectedMergeFiles[0].name.replace(/(\d+-\d+s.*)?\.[^.]+$/i, "") ||
-        "merged";
-      currentFileName = `${firstNameBase}_merged_accompaniment.wav`;
-
-      if (dlBtn) {
-        dlBtn.disabled = false;
-      }
-
-      if (autoSaveEnabled) {
-        await triggerDownloadOrShare({ isAuto: true, isFinalSegment: false });
-      } else {
-        statusEl.textContent = `統合完了 (${currentFileName})! 「音声 保存」を押して保存してください。`;
-      }
-    } catch (err) {
-      partsMono.length = 0;
-      statusEl.textContent = `統合エラー: ${err.message}`;
-    } finally {
-      mergeBtn.disabled = selectedMergeFiles.length < 2;
-      runBtn.disabled = !selectedFile;
-    }
-  });
-}
 
 async function encodeWavBlobChunked(channels, sampleRate) {
   const numChannels = channels.length;
@@ -666,7 +424,7 @@ async function encodeWavBlobChunked(channels, sampleRate) {
   writeStr(8, "WAVE");
   writeStr(12, "fmt ");
   headerView.setUint32(16, 16, true);
-  headerView.setUint16(20, 1, true);
+  headerView.setUint16(20, 1, true); // PCM
   headerView.setUint16(22, numChannels, true);
   headerView.setUint32(24, sampleRate, true);
   headerView.setUint32(28, sampleRate * numChannels * 2, true);
@@ -683,8 +441,8 @@ async function encodeWavBlobChunked(channels, sampleRate) {
     const segLen = end - start;
     const segBuf = new ArrayBuffer(segLen * numChannels * 2);
     const segView = new DataView(segBuf);
-    let offset = 0;
 
+    let offset = 0;
     for (let i = 0; i < segLen; i++) {
       for (let c = 0; c < numChannels; c++) {
         const s = Math.max(-1, Math.min(1, channels[c][start + i]));
@@ -692,6 +450,7 @@ async function encodeWavBlobChunked(channels, sampleRate) {
         offset += 2;
       }
     }
+
     parts.push(segBuf);
     await yieldTick(15);
   }
@@ -700,5 +459,5 @@ async function encodeWavBlobChunked(channels, sampleRate) {
 }
 
 dlBtn.addEventListener("click", async () => {
-  await triggerDownloadOrShare({ isAuto: false, isFinalSegment: false });
+  await triggerDownloadOrShare({ isAuto: false });
 });
