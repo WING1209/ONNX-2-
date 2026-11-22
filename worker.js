@@ -1,5 +1,9 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
 
+// iOS Safari でのクラッシュ・メモリ膨張を防ぐための必須設定
+ort.env.wasm.numThreads = 1;
+ort.env.wasm.proxy = false;
+
 const MODEL_URLS = {
   vocals:
     "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems/resolve/main/vocals.onnx?download=true",
@@ -16,9 +20,9 @@ const HOP_LENGTH = 1024;
 const FREQ_BINS = N_FFT / 2 + 1; // 2049
 const MODEL_BINS = 1024;
 
-// メモリ負荷を抑えるため 6秒チャンク + 0.5秒オーバーラップに設定
-const CHUNK_SAMPLES = 44100 * 6;
-const OVERLAP_SAMPLES = Math.floor(44100 * 0.5);
+// iPhone向けにチャンクをさらに小さく設定（3秒チャンク + 0.3秒オーバーラップ）
+const CHUNK_SAMPLES = 44100 * 3;
+const OVERLAP_SAMPLES = Math.floor(44100 * 0.3);
 
 function createPeriodicHannWindow(length) {
   const win = new Float32Array(length);
@@ -30,9 +34,6 @@ function createPeriodicHannWindow(length) {
 
 const HANN_WINDOW = createPeriodicHannWindow(N_FFT);
 
-/**
- * ブラウザの Cache Storage からモデルバイナリを取得（初回のみDLして保存、2回目以降はキャッシュ利用）
- */
 async function loadModelArrayBuffer(stemKey, url) {
   const cacheSupported = typeof caches !== "undefined";
 
@@ -42,14 +43,14 @@ async function loadModelArrayBuffer(stemKey, url) {
     if (cachedResponse && cachedResponse.ok) {
       postMessage({
         type: "progress",
-        message: `[${stemKey}] 保存済みキャッシュからモデル読込中...`,
+        message: `[${stemKey}] キャッシュからモデル読込中...`,
       });
       return await cachedResponse.arrayBuffer();
     }
 
     postMessage({
       type: "progress",
-      message: `[${stemKey}] モデルを初回ダウンロード＆ブラウザ保存中...`,
+      message: `[${stemKey}] モデルをダウンロード＆保存中...`,
     });
 
     const response = await fetch(url);
@@ -57,7 +58,6 @@ async function loadModelArrayBuffer(stemKey, url) {
       throw new Error(`${stemKey} モデルの取得に失敗しました (HTTP ${response.status})`);
     }
 
-    // キャッシュ保存用にクローンして格納
     await cache.put(url, response.clone());
     return await response.arrayBuffer();
   }
@@ -74,42 +74,36 @@ async function loadModelArrayBuffer(stemKey, url) {
   return await response.arrayBuffer();
 }
 
-/**
- * 1モデル分のセッションをロード
- */
 async function createSingleSession(stemKey) {
   const url = MODEL_URLS[stemKey];
-  const modelBuffer = await loadModelArrayBuffer(stemKey, url);
+  let modelBuffer = await loadModelArrayBuffer(stemKey, url);
 
   postMessage({
     type: "progress",
-    message: `[${stemKey}] AIセッションを展開中...`,
+    message: `[${stemKey}] AIセッションを展開中 (省メモリモード)...`,
   });
 
-  const session = await ort.InferenceSession.create(new Uint8Array(modelBuffer), {
+  const modelBytes = new Uint8Array(modelBuffer);
+  modelBuffer = null; // 参照を早めに解放
+
+  const session = await ort.InferenceSession.create(modelBytes, {
     executionProviders: ["wasm"],
+    enableMemPattern: false,
+    enableCpuMemArena: false,
   });
 
   return session;
 }
 
-/**
- * セッションを明示的に解放
- */
 async function releaseSession(session) {
   if (!session) return;
   try {
     if (typeof session.release === "function") {
       await session.release();
     }
-  } catch (_) {
-    // 解放時の軽微なエラーは無視
-  }
+  } catch (_) {}
 }
 
-/**
- * 基数2のインプレース FFT / IFFT (dir: 1 = FFT, -1 = IFFT)
- */
 function fftInPlace(re, im, dir) {
   const n = re.length;
   for (let i = 1, j = 0; i < n; i++) {
@@ -319,13 +313,9 @@ function reconChannelWithTensor(stftObj, chIdx, outTensor, metaInfo, outputLengt
     }
   }
 
-  const audio = computeIstft(mRe, mIm, totalFrames, outputLength);
-  return audio;
+  return computeIstft(mRe, mIm, totalFrames, outputLength);
 }
 
-/**
- * 1つのモデル（vocals または accompaniment）について全チャンクを処理
- */
 async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
   const totalLength = left.length;
   const step = Math.max(1, CHUNK_SAMPLES - OVERLAP_SAMPLES);
@@ -368,7 +358,6 @@ async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
       const outL = reconChannelWithTensor(leftStft, 0, outTensor, built, leftSlice.length);
       const outR = reconChannelWithTensor(rightStft, 1, outTensor, built, rightSlice.length);
 
-      // チャンク用テンソル・STFT配列を即座に破棄
       built.tensor.dispose();
       outTensor.dispose();
       leftStft = null;
@@ -391,7 +380,6 @@ async function processSingleStem(stemKey, left, right, dstLeft, dstRight) {
       }
     }
   } finally {
-    // 次のモデルに移る前に必ずセッションを解放
     await releaseSession(session);
     session = null;
   }
@@ -420,7 +408,6 @@ self.onmessage = async (e) => {
       },
     };
 
-    // 1モデルずつ順番にロード・推論・解放して同時メモリ使用量を抑える
     for (let i = 0; i < STEM_KEYS.length; i++) {
       const key = STEM_KEYS[i];
       await processSingleStem(
