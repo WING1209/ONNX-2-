@@ -221,9 +221,6 @@ function computeIstft(reSpec, imSpec, numFrames, outputLength) {
   return out;
 }
 
-/**
- * モデル仕様 [2, 1, 512, 1024] を厳守して入力テンソルを構築
- */
 function buildFixed512Tensor(session, leftStft, rightStft) {
   const inputName = session.inputNames[0];
   const meta = session.inputMetadata?.[inputName];
@@ -341,7 +338,6 @@ self.onmessage = async (e) => {
     const totalBlocks = Math.max(1, Math.ceil(totalLength / BLOCK_SAMPLES));
 
     for (let blockIdx = 0; blockIdx < totalBlocks; blockIdx++) {
-      // 一定ブロックごとにセッションを再生成して WASM ヒープ膨張を防止
       if (blockIdx > 0 && blockIdx % SESSION_RECYCLE_BLOCKS === 0) {
         postMessage({
           type: "progress",
