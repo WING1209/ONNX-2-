@@ -306,9 +306,6 @@ function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength)
   return computeIstft(mRe, mIm, totalFrames, outputLength);
 }
 
-/**
- * ブロックのオーバーラップ区間をコサイン曲線で滑らかにクロスフェードして繋ぐ
- */
 function writeBlockWithCrossfade(dstLeft, dstRight, outL, outR, start, totalLength, blockIdx, totalBlocks) {
   const len = Math.min(outL.length, outR.length);
   const hasPrevBlock = blockIdx > 0;
@@ -322,7 +319,6 @@ function writeBlockWithCrossfade(dstLeft, dstRight, outL, outR, start, totalLeng
     let sampleL = outL[i];
     let sampleR = outR[i];
 
-    // 前ブロックとの重なり区間（先頭 fadeLen サンプル）を滑らかにフェードイン
     if (hasPrevBlock && fadeLen > 0 && i < fadeLen) {
       const t = i / fadeLen;
       const wIn = 0.5 * (1 - Math.cos(Math.PI * t));
@@ -331,7 +327,6 @@ function writeBlockWithCrossfade(dstLeft, dstRight, outL, outR, start, totalLeng
       sampleR = dstRight[outIdx] * wPrev + sampleR * wIn;
     }
 
-    // 次ブロックと重なる末尾区間（末尾 fadeLen サンプル）は、まだ次ブロックが来ていないのでそのまま置くかフェードアウト
     if (hasNextBlock && fadeLen > 0 && i >= len - fadeLen) {
       const t = (i - (len - fadeLen)) / fadeLen;
       const wOut = 0.5 * (1 + Math.cos(Math.PI * t));
