@@ -1,7 +1,7 @@
 const APP_VERSION = "Ver.1.13";
 const TARGET_SAMPLE_RATE = 44100;
 
-// iOSのメモリピークを抑える軽量出力設定
+// 大容量ファイルでのメモリピークを抑える出力設定
 const OUTPUT_SAMPLE_RATE = 22050;
 const OUTPUT_CHANNELS = 1;
 
@@ -81,10 +81,6 @@ function terminateWorkerSafely() {
   }
 }
 
-/**
- * 1段階目のダウンロード要求が押された／走ったタイミングで
- * バックグラウンドワーカーや不要な参照を解放する
- */
 function releaseBackgroundMemoryOnDownload(urlToKeepBriefly = null) {
   terminateWorkerSafely();
   selectedFile = null;
@@ -120,7 +116,7 @@ function releaseBackgroundMemoryOnDownload(urlToKeepBriefly = null) {
   }
 }
 
-function yieldTick(ms = 25) {
+function yieldTick(ms = 30) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -280,7 +276,7 @@ function attachWorkerHandlers(w) {
       statusEl.textContent = "ステップ3/3: 音声ファイルを生成中...";
 
       try {
-        await yieldTick(30);
+        await yieldTick(35);
 
         if (accompaniment) {
           let chL = accompaniment.left;
@@ -297,6 +293,8 @@ function attachWorkerHandlers(w) {
           );
           chL = null;
           chR = null;
+
+          await yieldTick(25);
 
           currentAudioBlob = await encodeWavBlobChunked(
             builtOut.channels,
@@ -363,7 +361,7 @@ runBtn.addEventListener("click", async () => {
   statusEl.textContent = "ステップ1/3: 音声データを読み込み中...";
 
   try {
-    const arrayBuffer = await selectedFile.arrayBuffer();
+    let arrayBuffer = await selectedFile.arrayBuffer();
     const AudioContextClass = window.AudioContext || window.webkitAudioContext;
     const audioCtx = new AudioContextClass();
     let audioBuffer;
@@ -371,6 +369,7 @@ runBtn.addEventListener("click", async () => {
     try {
       audioBuffer = await audioCtx.decodeAudioData(arrayBuffer);
     } finally {
+      arrayBuffer = null;
       if (typeof audioCtx.close === "function") {
         await audioCtx.close().catch(() => {});
       }
@@ -384,9 +383,15 @@ runBtn.addEventListener("click", async () => {
       statusEl.textContent = `ステップ1/3: 44100Hz・ステレオに変換中... (元: ${audioBuffer.sampleRate}Hz / ${audioBuffer.numberOfChannels}ch)`;
     }
 
-    const normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
+    let normalizedBuffer = await normalizeTo44100Stereo(audioBuffer);
+    audioBuffer = null;
+
+    await yieldTick(25);
+
     const left = new Float32Array(normalizedBuffer.getChannelData(0));
     const right = new Float32Array(normalizedBuffer.getChannelData(1));
+    const outRate = normalizedBuffer.sampleRate;
+    normalizedBuffer = null;
 
     worker = new Worker("worker.js?v=1.13", { type: "module" });
     attachWorkerHandlers(worker);
@@ -394,7 +399,7 @@ runBtn.addEventListener("click", async () => {
     statusEl.textContent = "ステップ2/3: モデル確認・伴奏抽出を開始中...";
     worker.postMessage(
       {
-        sampleRate: normalizedBuffer.sampleRate,
+        sampleRate: outRate,
         left,
         right,
       },
@@ -424,7 +429,7 @@ async function encodeWavBlobChunked(channels, sampleRate) {
   writeStr(8, "WAVE");
   writeStr(12, "fmt ");
   headerView.setUint32(16, 16, true);
-  headerView.setUint16(20, 1, true); // PCM
+  headerView.setUint16(20, 1, true);
   headerView.setUint16(22, numChannels, true);
   headerView.setUint32(24, sampleRate, true);
   headerView.setUint32(28, sampleRate * numChannels * 2, true);
@@ -452,7 +457,7 @@ async function encodeWavBlobChunked(channels, sampleRate) {
     }
 
     parts.push(segBuf);
-    await yieldTick(15);
+    await yieldTick(18);
   }
 
   return new Blob(parts, { type: "audio/wav" });
