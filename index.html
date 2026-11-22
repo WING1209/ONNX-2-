@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>【WING】-stem separation- Ver.1.14</title>
+<title>【WING】-stem separation- Ver.1.13</title>
 <style>
 * { box-sizing: border-box; }
 body {
@@ -83,7 +83,7 @@ body {
   justify-content: space-between;
   align-items: center;
   gap: 10px;
-  margin: 0 0 12px;
+  margin: 0 0 14px;
   padding: 10px 14px;
   border-radius: 16px;
   background: #f3e8ff;
@@ -116,48 +116,6 @@ body {
 .auto-save-btn:active {
   transform: translate(2px, 2px);
   box-shadow: 0px 0px 0px #1e1b4b;
-}
-.range-panel {
-  margin: 0 0 14px;
-  padding: 12px 14px;
-  border-radius: 16px;
-  background: #ecfeff;
-  border: 2.5px solid #1e1b4b;
-  box-shadow: 3px 3px 0px #1e1b4b;
-}
-.range-title {
-  font-size: 0.88rem;
-  font-weight: 900;
-  margin-bottom: 8px;
-  color: #1e1b4b;
-}
-.range-grid {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 10px;
-}
-.range-field label {
-  display: block;
-  font-size: 0.78rem;
-  font-weight: 800;
-  margin-bottom: 4px;
-  color: #334155;
-}
-.range-field input {
-  width: 100%;
-  padding: 8px 10px;
-  border-radius: 10px;
-  border: 2px solid #1e1b4b;
-  background: #ffffff;
-  font-size: 0.92rem;
-  font-weight: 800;
-  color: #1e1b4b;
-}
-.range-hint {
-  margin-top: 6px;
-  font-size: 0.75rem;
-  font-weight: 700;
-  color: #0f766e;
 }
 .file-label {
   display: flex;
@@ -228,78 +186,6 @@ input[type="file"] {
   box-shadow: 3px 3px 0px #cbd5e1;
   cursor: not-allowed;
 }
-.merge-panel {
-  margin-top: 16px;
-  padding: 14px;
-  border-radius: 18px;
-  background: #fef3c7;
-  border: 2.5px solid #1e1b4b;
-  box-shadow: 4px 4px 0px #1e1b4b;
-}
-.merge-title {
-  font-size: 0.92rem;
-  font-weight: 900;
-  margin-bottom: 8px;
-  color: #1e1b4b;
-}
-.merge-pick-label {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 4px;
-  width: 100%;
-  padding: 12px 10px;
-  border: 2.5px dashed #d97706;
-  border-radius: 14px;
-  background: #ffffff;
-  font-size: 0.9rem;
-  font-weight: 800;
-  color: #1e1b4b;
-  cursor: pointer;
-  text-align: center;
-}
-.merge-pick-sub {
-  font-size: 0.74rem;
-  font-weight: 700;
-  color: #92400e;
-}
-.merge-list {
-  margin-top: 10px;
-  padding-left: 18px;
-  font-size: 0.8rem;
-  font-weight: 700;
-  color: #1e1b4b;
-  word-break: break-all;
-}
-.merge-list li {
-  margin-bottom: 4px;
-}
-.merge-btn {
-  display: block;
-  width: 100%;
-  padding: 13px;
-  margin-top: 10px;
-  font-size: 0.98rem;
-  font-weight: 900;
-  border: 2.5px solid #1e1b4b;
-  border-radius: 15px;
-  background: linear-gradient(90deg, #fbbf24 0%, #fb7185 100%);
-  color: #1e1b4b;
-  box-shadow: 4px 4px 0px #1e1b4b;
-  cursor: pointer;
-}
-.merge-btn:active:not(:disabled) {
-  transform: translate(3px, 3px);
-  box-shadow: 1px 1px 0px #1e1b4b;
-}
-.merge-btn:disabled {
-  background: #e2e8f0;
-  color: #64748b;
-  border-color: #94a3b8;
-  box-shadow: none;
-  cursor: not-allowed;
-}
 .status {
   margin-top: 14px;
   padding: 11px 14px;
@@ -366,44 +252,18 @@ input[type="file"] {
   <header class="app-title">
     <span class="title-rainbow">【WING】</span><br>
     <span class="title-accent">-stem separation-</span><br>
-    <span class="title-version">Ver.1.13/span>
+    <span class="title-version">Ver.1.13</span>
   </header>
   <div class="auto-save-bar">
     <span class="auto-save-label">💾 完了後の自動保存</span>
     <button id="autoSaveToggle" type="button" class="auto-save-btn is-on" aria-pressed="true">ON</button>
   </div>
-  <div class="range-panel">
-    <div class="range-title">✂️ 曲終了まで自動分割切り出し設定 (FP16)</div>
-    <div class="range-grid">
-      <div class="range-field">
-        <label for="startSecInput">開始位置 (秒)</label>
-        <input id="startSecInput" type="number" min="0" step="1" value="0">
-      </div>
-      <div class="range-field">
-        <label for="durationSecInput">1区間の長さ (秒)</label>
-        <input id="durationSecInput" type="number" min="5" max="120" step="1" value="45">
-      </div>
-    </div>
-    <div class="range-hint">例: 45秒指定なら 0-45s → 45-90s → 90-曲終了 まで自動で順番に抽出します。</div>
-  </div>
   <label for="audioFile" class="file-label" id="fileLabel">
     <span>♫♪ 音源ファイルを選択 (タップ) ✨</span>
-    <span class="file-sub" id="fileSub">対応形式: MP3 / WAV (曲終了まで自動分割)</span>
+    <span class="file-sub" id="fileSub">対応形式: MP3 / WAV (44100Hz・ステレオ)</span>
   </label>
   <input type="file" id="audioFile" accept=".mp3, .wav, audio/mpeg, audio/wav">
   <button id="runBtn" class="btn" disabled>🎸 伴奏抽出を実行！</button>
-
-  <section class="merge-panel">
-    <div class="merge-title">🧩 細切れファイルをロードして1つに統合</div>
-    <label for="mergeFilesInput" class="merge-pick-label">
-      <span>📂 統合する細切れWAV/MP3を複数選択</span>
-      <span class="merge-pick-sub" id="mergePickSub">0-45s / 45-90s などのファイルをまとめて選択（秒数順に自動整列）</span>
-    </label>
-    <input type="file" id="mergeFilesInput" accept=".wav, .mp3, audio/wav, audio/mpeg" multiple>
-    <ol id="mergeFileList" class="merge-list"></ol>
-    <button id="mergeBtn" type="button" class="merge-btn" disabled>🔗 選択したファイルを1つに統合！</button>
-  </section>
-
   <div id="status" class="status">MP3 または WAVファイルを選択してください。</div>
   <div id="results">
     <div class="stem">
@@ -412,6 +272,6 @@ input[type="file"] {
     </div>
   </div>
 </div>
-<script type="module" src="app.js?v=1.14-fp16-merge"></script>
+<script type="module" src="app.js?v=1.13"></script>
 </body>
 </html>
