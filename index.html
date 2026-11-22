@@ -301,22 +301,22 @@ input[type="file"] {
     <button id="autoSaveToggle" type="button" class="auto-save-btn is-on" aria-pressed="true">ON</button>
   </div>
   <div class="range-panel">
-    <div class="range-title">✂️ クラッシュ防止の区間切り出し設定</div>
+    <div class="range-title">✂️ 曲終了まで自動分割切り出し設定 (FP16)</div>
     <div class="range-grid">
       <div class="range-field">
         <label for="startSecInput">開始位置 (秒)</label>
         <input id="startSecInput" type="number" min="0" step="1" value="0">
       </div>
       <div class="range-field">
-        <label for="durationSecInput">抽出する長さ (秒)</label>
+        <label for="durationSecInput">1区間の長さ (秒)</label>
         <input id="durationSecInput" type="number" min="5" max="120" step="1" value="45">
       </div>
     </div>
-    <div class="range-hint">長い曲は 45秒前後ずつ切り出して保存するとクラッシュしにくくなります。</div>
+    <div class="range-hint">例: 45秒指定なら 0-45s → 45-90s → 90-曲終了 まで自動で順番に抽出します。</div>
   </div>
   <label for="audioFile" class="file-label" id="fileLabel">
     <span>♫♪ 音源ファイルを選択 (タップ) ✨</span>
-    <span class="file-sub" id="fileSub">対応形式: MP3 / WAV (指定区間を抽出)</span>
+    <span class="file-sub" id="fileSub">対応形式: MP3 / WAV (曲終了まで自動分割)</span>
   </label>
   <input type="file" id="audioFile" accept=".mp3, .wav, audio/mpeg, audio/wav">
   <button id="runBtn" class="btn" disabled>🎸 伴奏抽出を実行！</button>
@@ -328,6 +328,6 @@ input[type="file"] {
     </div>
   </div>
 </div>
-<script type="module" src="app.js?v=1.14-slice"></script>
+<script type="module" src="app.js?v=1.14-fp16-auto"></script>
 </body>
 </html>
