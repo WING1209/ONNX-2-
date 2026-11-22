@@ -1,9 +1,10 @@
-import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
+import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.min.mjs";
 
 // iOS Safari でのクラッシュ・WASMメモリ膨張を抑える設定
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 ort.env.wasm.simd = false;
+ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/";
 
 const ACCOMPANIMENT_MODEL_URL =
   "https://huggingface.co/csukuangfj/sherpa-onnx-spleeter-2stems-fp16/resolve/main/accompaniment.fp16.onnx?download=true";
@@ -87,6 +88,33 @@ function createPeriodicHannWindow(length) {
 
 const HANN_WINDOW = createPeriodicHannWindow(N_FFT);
 
+function yieldForGC(ms = 90) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function fetchWithRetry(url, retries = 3) {
+  let lastErr = null;
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    try {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}`);
+      }
+      return response;
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        postMessage({
+          type: "progress",
+          message: `通信を再試行中 (${attempt}/${retries})...`,
+        });
+        await yieldForGC(400 * attempt);
+      }
+    }
+  }
+  throw lastErr || new Error("ネットワーク取得に失敗しました。");
+}
+
 async function loadAccompanimentModelBytes() {
   const cacheSupported = typeof caches !== "undefined";
 
@@ -107,11 +135,7 @@ async function loadAccompanimentModelBytes() {
       message: "FP16伴奏モデルを初回ダウンロード＆保存中...",
     });
 
-    const response = await fetch(ACCOMPANIMENT_MODEL_URL);
-    if (!response.ok) {
-      throw new Error(`FP16伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
-    }
-
+    const response = await fetchWithRetry(ACCOMPANIMENT_MODEL_URL, 3);
     await cache.put(ACCOMPANIMENT_MODEL_URL, response.clone());
     const buf = await response.arrayBuffer();
     return new Uint8Array(buf);
@@ -122,21 +146,40 @@ async function loadAccompanimentModelBytes() {
     message: "FP16伴奏モデルをダウンロード中...",
   });
 
-  const response = await fetch(ACCOMPANIMENT_MODEL_URL);
-  if (!response.ok) {
-    throw new Error(`FP16伴奏モデルの取得に失敗しました (HTTP ${response.status})`);
-  }
+  const response = await fetchWithRetry(ACCOMPANIMENT_MODEL_URL, 3);
   const buf = await response.arrayBuffer();
   return new Uint8Array(buf);
 }
 
-async function createSessionFromBytes(modelBytes) {
-  return await ort.InferenceSession.create(modelBytes, {
-    executionProviders: ["wasm"],
-    enableMemPattern: false,
-    enableCpuMemArena: false,
-    graphOptimizationLevel: "basic",
-  });
+async function createSessionFromBytes(modelBytes, retries = 3) {
+  let lastErr = null;
+  const cdnCandidates = [
+    "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/",
+    "https://unpkg.com/onnxruntime-web@1.19.2/dist/",
+  ];
+
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    ort.env.wasm.wasmPaths = cdnCandidates[(attempt - 1) % cdnCandidates.length];
+    try {
+      return await ort.InferenceSession.create(modelBytes, {
+        executionProviders: ["wasm"],
+        enableMemPattern: false,
+        enableCpuMemArena: false,
+        graphOptimizationLevel: "basic",
+      });
+    } catch (err) {
+      lastErr = err;
+      if (attempt < retries) {
+        postMessage({
+          type: "progress",
+          message: `WASM初期化を再試行中 (${attempt}/${retries})...`,
+        });
+        await yieldForGC(500 * attempt);
+      }
+    }
+  }
+
+  throw lastErr || new Error("WASMセッションの初期化に失敗しました。");
 }
 
 async function releaseSession(session) {
@@ -412,10 +455,6 @@ function clampBuffer(buf) {
   }
 }
 
-function yieldForGC(ms = 90) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 self.onmessage = async (e) => {
   let session = null;
   let modelBytes = null;
@@ -434,7 +473,7 @@ self.onmessage = async (e) => {
       message: "FP16 AIセッションを初期化中 (512フレーム仕様)...",
     });
 
-    session = await createSessionFromBytes(modelBytes);
+    session = await createSessionFromBytes(modelBytes, 3);
     const inputName = session.inputNames[0];
     const outputName = session.outputNames[0];
 
@@ -449,7 +488,7 @@ self.onmessage = async (e) => {
         await releaseSession(session);
         session = null;
         await yieldForGC(140);
-        session = await createSessionFromBytes(modelBytes);
+        session = await createSessionFromBytes(modelBytes, 3);
       }
 
       const start = blockIdx * STEP_SAMPLES;
