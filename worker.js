@@ -1,6 +1,6 @@
 import * as ort from "https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.mjs";
 
-// iOS Safari でのクラッシュ・WASMメモリ膨張を防ぐ設定
+// iOS Safari でのクラッシュ・WASMメモリ膨張を抑える設定
 ort.env.wasm.numThreads = 1;
 ort.env.wasm.proxy = false;
 ort.env.wasm.simd = false;
@@ -14,14 +14,14 @@ const MODEL_CACHE_NAME = "wing-spleeter-accompaniment-cache-v1";
 const N_FFT = 4096;
 const HOP_LENGTH = 1024;
 const FREQ_BINS = N_FFT / 2 + 1; // 2049
+
+// モデル入力 x の仕様: [channels, splits, frames=512, bins=1024]
+const MODEL_FRAMES = 512;
 const MODEL_BINS = 1024;
+const BLOCK_SAMPLES = MODEL_FRAMES * HOP_LENGTH; // 524,288 サンプル (約11.89秒)
 
-// U-Net のダウンサンプリング倍数（16の倍数）に合わせた極小フレーム数（64フレーム ≒ 約1.48秒）
-const MIN_DYNAMIC_FRAMES = 64;
-const OVERLAP_FRAMES = 8; // 約0.18秒のオーバーラップで継ぎ目を滑らかに接続
-
-// iOS Safari で WASM ヒープが膨らみ続けるのを防ぐため、12チャンクごとにセッションを再初期化
-const SESSION_RECYCLE_INTERVAL = 12;
+// 一定ブロックごとにセッションを解放・再生成して iOS の WASM ヒープ膨張を抑制
+const SESSION_RECYCLE_BLOCKS = 6;
 
 function createPeriodicHannWindow(length) {
   const win = new Float32Array(length);
@@ -222,51 +222,53 @@ function computeIstft(reSpec, imSpec, numFrames, outputLength) {
 }
 
 /**
- * モデルの入力メタデータを確認し、動的軸なら極小フレーム（64フレーム）、
- * 固定軸ならそのフレーム数を返す
+ * モデル仕様 [2, 1, 512, 1024] を厳守して入力テンソルを構築
  */
-function resolveChunkFrames(session) {
+function buildFixed512Tensor(session, leftStft, rightStft) {
   const inputName = session.inputNames[0];
   const meta = session.inputMetadata?.[inputName];
   const dims = meta?.dimensions || [];
 
   const chDim = typeof dims[0] === "number" && dims[0] > 0 ? dims[0] : 2;
-  const isTimeFixed = typeof dims[2] === "number" && dims[2] > 0;
-  const targetFrames = isTimeFixed ? dims[2] : MIN_DYNAMIC_FRAMES;
-  const freqBins = typeof dims[3] === "number" && dims[3] > 0 ? dims[3] : MODEL_BINS;
+  const numSplits = typeof dims[1] === "number" && dims[1] > 0 ? dims[1] : 1;
+  const targetFrames =
+    typeof dims[2] === "number" && dims[2] > 0 ? dims[2] : MODEL_FRAMES;
+  const freqBins =
+    typeof dims[3] === "number" && dims[3] > 0 ? dims[3] : MODEL_BINS;
 
-  return { chDim, targetFrames, freqBins, isTimeFixed };
-}
-
-function buildMiniTensor(spec, leftStft, rightStft) {
-  const { chDim, targetFrames, freqBins } = spec;
-  const numSplits = 1;
   const totalFrames = leftStft.numFrames;
-
   const data = new Float32Array(chDim * numSplits * targetFrames * freqBins);
 
   for (let c = 0; c < chDim; c++) {
     const srcRe = c === 0 ? leftStft.re : rightStft.re;
     const srcIm = c === 0 ? leftStft.im : rightStft.im;
 
-    const copyFrames = Math.min(targetFrames, totalFrames);
-    for (let t = 0; t < copyFrames; t++) {
-      const dstOffset = (c * targetFrames + t) * freqBins;
-      const srcOffset = t * FREQ_BINS;
-      const copyBins = Math.min(freqBins, FREQ_BINS);
-      for (let b = 0; b < copyBins; b++) {
-        const r = srcRe[srcOffset + b];
-        const im = srcIm[srcOffset + b];
-        data[dstOffset + b] = Math.hypot(r, im);
+    for (let sp = 0; sp < numSplits; sp++) {
+      const copyFrames = Math.min(targetFrames, Math.max(0, totalFrames - sp * targetFrames));
+      for (let t = 0; t < copyFrames; t++) {
+        const frameIdx = sp * targetFrames + t;
+        const dstOffset = ((c * numSplits + sp) * targetFrames + t) * freqBins;
+        const srcOffset = frameIdx * FREQ_BINS;
+        const copyBins = Math.min(freqBins, FREQ_BINS);
+        for (let b = 0; b < copyBins; b++) {
+          const r = srcRe[srcOffset + b];
+          const im = srcIm[srcOffset + b];
+          data[dstOffset + b] = Math.hypot(r, im);
+        }
       }
     }
   }
 
-  return new ort.Tensor("float32", data, [chDim, numSplits, targetFrames, freqBins]);
+  return {
+    tensor: new ort.Tensor("float32", data, [chDim, numSplits, targetFrames, freqBins]),
+    numSplits,
+    targetFrames,
+    freqBins,
+  };
 }
 
-function reconChannelMini(stftObj, chIdx, outTensor, spec, outputLength) {
-  const { targetFrames, freqBins } = spec;
+function reconChannelFixed512(stftObj, chIdx, outTensor, specInfo, outputLength) {
+  const { numSplits, targetFrames, freqBins } = specInfo;
   const dims = outTensor.dims || [];
   const chCountInOut = dims.length >= 1 && dims[0] >= 2 ? 2 : 1;
   const outData = outTensor.data;
@@ -276,6 +278,8 @@ function reconChannelMini(stftObj, chIdx, outTensor, spec, outputLength) {
   const mIm = new Float32Array(stftObj.im.length);
 
   for (let f = 0; f < totalFrames; f++) {
+    const sp = Math.floor(f / targetFrames);
+    const t = f % targetFrames;
     const base = f * FREQ_BINS;
 
     for (let b = 0; b < FREQ_BINS; b++) {
@@ -284,9 +288,9 @@ function reconChannelMini(stftObj, chIdx, outTensor, spec, outputLength) {
       const origMag = Math.hypot(r, im);
 
       let gain = 1.0;
-      if (f < targetFrames && b < freqBins) {
+      if (sp < numSplits && b < freqBins) {
         const actualCh = chCountInOut >= 2 ? chIdx : 0;
-        const outIdx = (actualCh * targetFrames + f) * freqBins + b;
+        const outIdx = ((actualCh * numSplits + sp) * targetFrames + t) * freqBins + b;
         const predVal = outData[outIdx];
         if (typeof predVal === "number" && Number.isFinite(predVal)) {
           gain = origMag > 1e-6 ? Math.max(0, Math.min(2.0, predVal / origMag)) : 0;
@@ -308,7 +312,7 @@ function clampBuffer(buf) {
   }
 }
 
-function yieldForGC(ms = 60) {
+function yieldForGC(ms = 80) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
@@ -327,33 +331,21 @@ self.onmessage = async (e) => {
 
     postMessage({
       type: "progress",
-      message: "AIセッションを初期化中...",
+      message: "AIセッションを初期化中 (512フレーム仕様)...",
     });
 
     session = await createSessionFromBytes(modelBytes);
-    const spec = resolveChunkFrames(session);
-
-    // 極小チャンクのサンプル数とオーバーラップを決定
-    const chunkSamples = Math.max(N_FFT + HOP_LENGTH, spec.targetFrames * HOP_LENGTH);
-    const overlapSamples = Math.min(
-      Math.floor(chunkSamples * 0.2),
-      OVERLAP_FRAMES * HOP_LENGTH
-    );
-    const step = Math.max(HOP_LENGTH, chunkSamples - overlapSamples);
-    const totalChunks = Math.max(1, Math.ceil(totalLength / step));
-
     const inputName = session.inputNames[0];
     const outputName = session.outputNames[0];
 
-    for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
-      const start = chunkIdx * step;
-      if (start >= totalLength) break;
+    const totalBlocks = Math.max(1, Math.ceil(totalLength / BLOCK_SAMPLES));
 
-      // 一定チャンクごとにセッションを再生成して iOS の WASM ヒープ膨張を防ぐ
-      if (chunkIdx > 0 && chunkIdx % SESSION_RECYCLE_INTERVAL === 0) {
+    for (let blockIdx = 0; blockIdx < totalBlocks; blockIdx++) {
+      // 一定ブロックごとにセッションを再生成して WASM ヒープ膨張を防止
+      if (blockIdx > 0 && blockIdx % SESSION_RECYCLE_BLOCKS === 0) {
         postMessage({
           type: "progress",
-          message: `メモリをリフレッシュ中... (${Math.round((chunkIdx / totalChunks) * 100)}%)`,
+          message: `メモリをリフレッシュ中... (${Math.round((blockIdx / totalBlocks) * 100)}%)`,
         });
         await releaseSession(session);
         session = null;
@@ -361,12 +353,13 @@ self.onmessage = async (e) => {
         session = await createSessionFromBytes(modelBytes);
       }
 
-      const end = Math.min(totalLength, start + chunkSamples);
-      const pct = Math.round(((chunkIdx + 1) / totalChunks) * 100);
+      const start = blockIdx * BLOCK_SAMPLES;
+      const end = Math.min(totalLength, start + BLOCK_SAMPLES);
+      const pct = Math.round(((blockIdx + 1) / totalBlocks) * 100);
 
       postMessage({
         type: "progress",
-        message: `伴奏を抽出中... ${pct}% (${chunkIdx + 1}/${totalChunks})`,
+        message: `伴奏を抽出中... ${pct}% (${blockIdx + 1}/${totalBlocks})`,
       });
 
       const leftSlice = left.subarray(start, end);
@@ -375,44 +368,30 @@ self.onmessage = async (e) => {
       let leftStft = computeStft(leftSlice);
       let rightStft = computeStft(rightSlice);
 
-      let inputTensor = buildMiniTensor(spec, leftStft, rightStft);
-      let results = await session.run({ [inputName]: inputTensor });
+      let built = buildFixed512Tensor(session, leftStft, rightStft);
+      let results = await session.run({ [inputName]: built.tensor });
       const outTensor = results[outputName];
 
       if (!outTensor) {
-        inputTensor.dispose();
+        built.tensor.dispose();
         throw new Error(`出力 "${outputName}" が取得できませんでした。`);
       }
 
-      const outL = reconChannelMini(leftStft, 0, outTensor, spec, leftSlice.length);
-      const outR = reconChannelMini(rightStft, 1, outTensor, spec, rightSlice.length);
+      const outL = reconChannelFixed512(leftStft, 0, outTensor, built, leftSlice.length);
+      const outR = reconChannelFixed512(rightStft, 1, outTensor, built, rightSlice.length);
 
-      inputTensor.dispose();
+      built.tensor.dispose();
       outTensor.dispose();
-      inputTensor = null;
+      built = null;
       results = null;
       leftStft = null;
       rightStft = null;
 
-      for (let i = 0; i < outL.length; i++) {
-        const outIdx = start + i;
-        if (outIdx >= totalLength) break;
+      dstLeft.set(outL, start);
+      dstRight.set(outR, start);
 
-        const overlapStart = outL.length - overlapSamples;
-        if (chunkIdx < totalChunks - 1 && overlapSamples > 0 && i >= overlapStart) {
-          const t = (i - overlapStart) / overlapSamples;
-          const fadeOut = 1 - t;
-          dstLeft[outIdx] = dstLeft[outIdx] * fadeOut + outL[i] * t;
-          dstRight[outIdx] = dstRight[outIdx] * fadeOut + outR[i] * t;
-        } else if (i < step || chunkIdx === totalChunks - 1) {
-          dstLeft[outIdx] = outL[i];
-          dstRight[outIdx] = outR[i];
-        }
-      }
-
-      // ブラウザに GC のタイミングを与える
-      if (chunkIdx % 2 === 1) {
-        await yieldForGC(20);
+      if (blockIdx < totalBlocks - 1) {
+        await yieldForGC(80);
       }
     }
 
